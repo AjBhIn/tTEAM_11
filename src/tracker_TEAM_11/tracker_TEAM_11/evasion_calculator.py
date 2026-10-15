@@ -8,6 +8,28 @@ from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import String
 import numpy as np
 
+# --- GLOBAL TUNING VARIABLES ---
+LOOP_RATE_SEC = 0.033
+
+# Costmap & Map Boundaries
+COSTMAP_MARGIN_CELLS = 6        # Was 15; reduced to allow fleeing closer to arena edges
+MAX_SAFE_COST = 75              # Was 40; increased so bot can squeeze through inflated crate gaps
+MAX_EMERGENCY_COST = 89         # Absolute maximum cost allowed before hitting a lethal obstacle (100)
+
+# Evasion Trigger Distances
+CLOSE_THREAT_DIST = 1.2         # Distance at which weights heavily shift to prioritize pure escape speed
+MIN_UPDATE_DIST = 0.02          # Minimum distance target must move to justify sending a new TF
+
+# Network Timeouts
+TF_TIMEOUT_SEC = 2.5            # Was 0.5s; relaxed for physical WiFi latency
+LOG_THROTTLE_SEC = 1.0          # How often to print warnings (prevents console spam)
+
+# Base Scoring Weights for Path Selection
+WEIGHT_DIST = 12.0
+WEIGHT_SPEED = 2.0
+WEIGHT_TURN = 3.0
+WEIGHT_COST = 0.5
+
 class EvasionCalculator(Node):
     """
     High-Performance Evasion node. Uses vectorized NumPy arrays to evaluate 144 escape paths 
@@ -51,7 +73,7 @@ class EvasionCalculator(Node):
         self.state_sub = self.create_subscription(String, state_topic, self.state_cb, 10)
         self.costmap_sub = self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_callback, 10)
 
-        # --- Vectorized Candidate Grid (Precomputed) ---
+        # --- Vectorized Candidate Grid (Precomputed for speed) ---
         # 4 radii * 36 angles = 144 candidate points evaluated simultaneously
         self.sample_radii = np.array([0.6, 1.0, 1.5, 2.0])
         angles = np.deg2rad(np.arange(0, 360, 10))
@@ -67,9 +89,6 @@ class EvasionCalculator(Node):
         self.map_width = self.map_height = 0
         self.map_origin_x = self.map_origin_y = 0.0 
         
-        self.MAX_SAFE_COST = 40
-        self.MIN_UPDATE_DIST = 0.02
-        
         self.last_target_x, self.last_target_y = None, None
         self.active_target_x, self.active_target_y = None, None
         
@@ -79,9 +98,9 @@ class EvasionCalculator(Node):
         self.last_log_time = 0.0
         self.last_tf_time = 0.0 
 
-        # 30Hz Overclock
-        self.timer = self.create_timer(0.033, self.control_loop)
-        self.get_logger().info("Ultra-Fast Robust EvasionCalculator initialized.")
+        # 30Hz Control Loop
+        self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
+        self.get_logger().info("Ultra-Fast Robust EvasionCalculator initialized (Physical Map Limits).")
 
     def state_cb(self, msg):
         self.current_state = msg.data
@@ -103,9 +122,8 @@ class EvasionCalculator(Node):
         raw_col = int((x - self.map_origin_x) / self.map_res)
         raw_row = int((y - self.map_origin_y) / self.map_res)
 
-        MARGIN = 15
-        if raw_col < MARGIN or raw_col >= (self.map_width - MARGIN) or \
-           raw_row < MARGIN or raw_row >= (self.map_height - MARGIN):
+        if raw_col < COSTMAP_MARGIN_CELLS or raw_col >= (self.map_width - COSTMAP_MARGIN_CELLS) or \
+           raw_row < COSTMAP_MARGIN_CELLS or raw_row >= (self.map_height - COSTMAP_MARGIN_CELLS):
             return 100
 
         col = max(0, min(raw_col, self.map_width - 1))
@@ -120,9 +138,8 @@ class EvasionCalculator(Node):
         raw_cols = ((xs - self.map_origin_x) / self.map_res).astype(np.int32)
         raw_rows = ((ys - self.map_origin_y) / self.map_res).astype(np.int32)
         
-        MARGIN = 15
-        invalid = (raw_cols < MARGIN) | (raw_cols >= (self.map_width - MARGIN)) | \
-                  (raw_rows < MARGIN) | (raw_rows >= (self.map_height - MARGIN))
+        invalid = (raw_cols < COSTMAP_MARGIN_CELLS) | (raw_cols >= (self.map_width - COSTMAP_MARGIN_CELLS)) | \
+                  (raw_rows < COSTMAP_MARGIN_CELLS) | (raw_rows >= (self.map_height - COSTMAP_MARGIN_CELLS))
                   
         cols = np.clip(raw_cols, 0, self.map_width - 1)
         rows = np.clip(raw_rows, 0, self.map_height - 1)
@@ -147,9 +164,8 @@ class EvasionCalculator(Node):
         raw_cols = ((px - self.map_origin_x) / self.map_res).astype(np.int32)
         raw_rows = ((py - self.map_origin_y) / self.map_res).astype(np.int32)
 
-        MARGIN = 15
-        if np.any(raw_cols < MARGIN) or np.any(raw_cols >= (self.map_width - MARGIN)) or \
-           np.any(raw_rows < MARGIN) or np.any(raw_rows >= (self.map_height - MARGIN)):
+        if np.any(raw_cols < COSTMAP_MARGIN_CELLS) or np.any(raw_cols >= (self.map_width - COSTMAP_MARGIN_CELLS)) or \
+           np.any(raw_rows < COSTMAP_MARGIN_CELLS) or np.any(raw_rows >= (self.map_height - COSTMAP_MARGIN_CELLS)):
             return False
 
         cols = np.clip(raw_cols, 0, self.map_width - 1)
@@ -178,11 +194,15 @@ class EvasionCalculator(Node):
         return False, 'NONE'
 
     def get_adaptive_weights(self, current_cost, dist_to_enemy):
-        w_dist, w_speed, w_turn, w_cost = 12.0, 2.0, 3.0, 0.5
+        """Dynamically adjust evasion weights based on map danger and enemy proximity."""
+        w_dist, w_speed, w_turn, w_cost = WEIGHT_DIST, WEIGHT_SPEED, WEIGHT_TURN, WEIGHT_COST
+        
         if current_cost > 20: 
             w_cost, w_turn = 1.5, 0.5
-        if dist_to_enemy < 1.2: 
+        if dist_to_enemy < CLOSE_THREAT_DIST: 
+            # Panic mode: heavily prioritize pure distance away from the enemy
             w_dist, w_speed = 22.0, 4.0
+            
         return {'w_dist': w_dist, 'w_speed': w_speed, 'w_turn': w_turn, 'w_cost': w_cost}
 
     def evaluate_and_select_best_escape(self, our_x, our_y, our_yaw, enemy_x, enemy_y, enemy_yaw):
@@ -198,8 +218,8 @@ class EvasionCalculator(Node):
         c_cost = self.get_cell_costs_vectorized(c_x, c_y)
         current_cost = self.get_cell_cost(our_x, our_y)
         
-        # Robustness: Cap dynamic threshold at 89 so paths are never projected through solid walls
-        effective_max_cost = min(89, max(self.MAX_SAFE_COST, current_cost))
+        # Robustness: Cap dynamic threshold so paths are never projected through solid walls
+        effective_max_cost = min(MAX_EMERGENCY_COST, max(MAX_SAFE_COST, current_cost))
         
         valid_mask = c_cost <= effective_max_cost
         if not np.any(valid_mask): return None, -1000.0
@@ -299,7 +319,7 @@ class EvasionCalculator(Node):
         cand_y = global_y + (r_grid * np.sin(a_grid)).flatten()
         
         costs = self.get_cell_costs_vectorized(cand_x, cand_y)
-        valid_mask = costs < 90
+        valid_mask = costs < MAX_EMERGENCY_COST
 
         if np.any(valid_mask):
             valid_x, valid_y, valid_costs = cand_x[valid_mask], cand_y[valid_mask], costs[valid_mask]
@@ -312,6 +332,7 @@ class EvasionCalculator(Node):
             best_yaw = math.atan2(best_y - global_y, best_x - global_x)
             return best_x, best_y, best_yaw
 
+        # Absolute worst case: drive straight away from enemy
         dx, dy = global_x - enemy_x, global_y - enemy_y
         escape_yaw = math.atan2(dy, dx) if math.hypot(dx, dy) > 0.01 else 0.0
         return global_x, global_y, escape_yaw
@@ -332,10 +353,10 @@ class EvasionCalculator(Node):
             tf_enemy_global = self.tf_buffer.lookup_transform(self.map_frame, self.enemy_frame, rclpy.time.Time())
             self.last_tf_time = now
         except tf2_ros.TransformException:
-            # Dead Man's Switch: Hold position if sensors fail
-            if now - self.last_tf_time > 0.5:
-                if now - self.last_log_time > 1.0:
-                    self.get_logger().warn("TF Data lost! Evasion halted to prevent runaway.")
+            # Dead Man's Switch: Hold position if sensors fail (relaxed for WiFi)
+            if now - self.last_tf_time > TF_TIMEOUT_SEC:
+                if now - self.last_log_time > LOG_THROTTLE_SEC:
+                    self.get_logger().warn(f"TF Data lost for >{TF_TIMEOUT_SEC}s! Evasion halted to prevent runway.")
                     self.last_log_time = now
                 if self.last_target_x is not None:
                     t = TransformStamped()
@@ -359,8 +380,8 @@ class EvasionCalculator(Node):
 
         # Trigger Emergency if standard paths are blocked OR if scores are deeply negative (wall corner)
         if best_target is None or max_score < -25.0:
-            if now - self.last_log_time > 1.0:
-                self.get_logger().warn("Standard paths rejected/blocked. Executing EMERGENCY ESCAPE.")
+            if now - self.last_log_time > LOG_THROTTLE_SEC:
+                self.get_logger().warn(f"Standard evasion paths blocked! Score: {max_score:.1f}. Triggering EMERGENCY ESCAPE.")
                 self.last_log_time = now
             target_x, target_y, target_yaw = self.execute_emergency_escape(global_x, global_y, enemy_global_x, enemy_global_y)
         else:
@@ -370,7 +391,7 @@ class EvasionCalculator(Node):
             alpha = 0.5
             target_x = alpha * target_x + (1.0 - alpha) * self.last_target_x
             target_y = alpha * target_y + (1.0 - alpha) * self.last_target_y
-            if math.hypot(target_x - self.last_target_x, target_y - self.last_target_y) < self.MIN_UPDATE_DIST: 
+            if math.hypot(target_x - self.last_target_x, target_y - self.last_target_y) < MIN_UPDATE_DIST: 
                 return        
         
         self.last_target_x, self.last_target_y = target_x, target_y
