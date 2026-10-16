@@ -31,6 +31,8 @@ WEIGHT_TURN = 3.0
 WEIGHT_COST = 0.5               
 WEIGHT_REAR_FLANK = 28.0        
 
+ENEMY_FORCE_FIELD_DIST = 0.45   
+
 class EvasionCalculator(Node):
     def __init__(self):
         super().__init__('evasion_calculator')
@@ -91,7 +93,7 @@ class EvasionCalculator(Node):
         self.last_tf_time = 0.0 
 
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[EVASION CALCULATOR] Initialized. NO REVERSING mode active.")
+        self.get_logger().info("[EVASION CALCULATOR] Initialized. 360 Emergency Rotation Active.")
 
     def state_cb(self, msg):
         self.current_state = msg.data
@@ -138,16 +140,12 @@ class EvasionCalculator(Node):
         costs = np.where((costs == -1) | invalid, 100, costs)
         return costs
 
-
-    # =================================================
-    # TODO: MAKE IT SIMPLE AND EFFECTIVE TO INCREASE SPEED AND SAVE SPACE
-    # =================================================
     def get_stuck_recovery_target(self, our_x: float, our_y: float, our_yaw: float, 
                                   enemy_x: float, enemy_y: float, current_cost: int):
-        self.get_logger().info("Running the STUCK RECOVERY METHOD!")
+        self.get_logger().warn("RUNNING the STUCK RECOVERY METHOD!")
         probe_angles = np.linspace(0, 2 * math.pi, 36, endpoint=False)
-        probe_x = our_x + 0.5 * np.cos(probe_angles)
-        probe_y = our_y + 0.5 * np.sin(probe_angles)
+        probe_x = our_x + 0.6 * np.cos(probe_angles)
+        probe_y = our_y + 0.6 * np.sin(probe_angles)
         probe_costs = self.get_cell_costs_vectorized(probe_x, probe_y)
 
         front_probe_x = our_x + HEAD_ON_PROBE_DIST * math.cos(our_yaw)
@@ -156,16 +154,16 @@ class EvasionCalculator(Node):
         facing_obstacle = (front_cost >= current_cost) or (front_cost >= MAX_SAFE_COST)
 
         cost_drop = current_cost - probe_costs
-        scores = cost_drop * 10.0
+        scores = cost_drop * 15.0
 
         dist_to_enemy = np.hypot(probe_x - enemy_x, probe_y - enemy_y)
         scores += dist_to_enemy * 2.0
 
         turn_diff = np.abs(np.arctan2(np.sin(probe_angles - our_yaw), np.cos(probe_angles - our_yaw)))
         
-        # --- FORWARD ONLY LOCK ---
-        # Massive penalty for anything behind the robot to prevent reversing
-        scores = np.where(turn_diff > np.deg2rad(100.0), scores - 500.0, scores)
+        angle_to_enemy = np.arctan2(enemy_y - our_y, enemy_x - our_x)
+        enemy_diff = np.abs(np.arctan2(np.sin(probe_angles - angle_to_enemy), np.cos(probe_angles - angle_to_enemy)))
+        scores = np.where(enemy_diff < np.deg2rad(45.0), scores - 500.0, scores)
 
         if facing_obstacle:
             scores = np.where(turn_diff < np.deg2rad(60.0), scores - 500.0, scores)
@@ -174,7 +172,6 @@ class EvasionCalculator(Node):
 
         valid_angles = probe_costs < MAX_EMERGENCY_COST
         if not np.any(valid_angles):
-            # NO BACKING UP. If completely trapped, drop goal here but spin 90 degrees to look for exit.
             escape_yaw = our_yaw + (math.pi / 2.0)
             return our_x, our_y, escape_yaw
 
@@ -185,7 +182,7 @@ class EvasionCalculator(Node):
         for d in (1.2, 1.0, 0.8, 0.6):
             tx = our_x + d * math.cos(best_escape_yaw)
             ty = our_y + d * math.sin(best_escape_yaw)
-            if self.get_cell_cost(tx, ty) <= 35:
+            if self.get_cell_cost(tx, ty) < MAX_SAFE_COST:
                 escape_dist = d
                 break
 
@@ -194,10 +191,14 @@ class EvasionCalculator(Node):
 
         return rec_x, rec_y, best_escape_yaw
 
-    def is_path_clear(self, start_x: float, start_y: float, end_x: float, end_y: float, max_cost: int) -> bool:
+    def is_path_clear(self, start_x: float, start_y: float, end_x: float, end_y: float, max_cost: int, e_x: float, e_y: float) -> bool:
         if self.map_data is None: return False
         dist = math.hypot(end_x - start_x, end_y - start_y)
-        if dist < 0.05: return self.get_cell_cost(end_x, end_y) <= max_cost
+        
+        start_dist_to_enemy = math.hypot(start_x - e_x, start_y - e_y)
+
+        if dist < 0.05: 
+            return self.get_cell_cost(end_x, end_y) <= max_cost
 
         step_size = 0.10 if dist <= 0.8 else 0.05
         steps = max(2, int(dist / step_size))
@@ -205,6 +206,11 @@ class EvasionCalculator(Node):
         t = np.linspace(0.0, 1.0, steps)
         px = start_x + t * (end_x - start_x)
         py = start_y + t * (end_y - start_y)
+
+        # SMART GEOMETRIC CHECK: Expanding Distance Rule
+        dist_to_enemy_arr = np.hypot(px - e_x, py - e_y)
+        if np.any((dist_to_enemy_arr < ENEMY_FORCE_FIELD_DIST) & (dist_to_enemy_arr < start_dist_to_enemy)):
+            return False
 
         raw_cols = ((px - self.map_origin_x) / self.map_res).astype(np.int32)
         raw_rows = ((py - self.map_origin_y) / self.map_res).astype(np.int32)
@@ -220,8 +226,8 @@ class EvasionCalculator(Node):
 
         return not (np.any(costs > max_cost) or np.any(costs == -1))
 
-    def check_path_feasibility(self, start_x, start_y, end_x, end_y, max_cost, enable_dogleg=True):
-        if self.is_path_clear(start_x, start_y, end_x, end_y, max_cost):
+    def check_path_feasibility(self, start_x, start_y, end_x, end_y, max_cost, e_x, e_y, enable_dogleg=True):
+        if self.is_path_clear(start_x, start_y, end_x, end_y, max_cost, e_x, e_y):
             return True, 'STRAIGHT'
         
         if not enable_dogleg:
@@ -235,8 +241,8 @@ class EvasionCalculator(Node):
         mid_y = start_y + (mid_dist * np.sin(direct_angle + test_angles))
         
         for i in range(len(test_angles)):
-            if self.is_path_clear(start_x, start_y, mid_x[i], mid_y[i], max_cost):
-                if self.is_path_clear(mid_x[i], mid_y[i], end_x, end_y, max_cost):
+            if self.is_path_clear(start_x, start_y, mid_x[i], mid_y[i], max_cost, e_x, e_y):
+                if self.is_path_clear(mid_x[i], mid_y[i], end_x, end_y, max_cost, e_x, e_y):
                     return True, 'DOGLEG'
         return False, 'NONE'
 
@@ -262,9 +268,10 @@ class EvasionCalculator(Node):
         effective_max_cost = min(MAX_EMERGENCY_COST, max(MAX_SAFE_COST, current_cost))
         
         valid_mask = c_cost <= effective_max_cost
+        
         if not np.any(valid_mask): 
             return None, -1000.0
-            
+        
         c_x, c_y, c_r, c_cost = c_x[valid_mask], c_y[valid_mask], c_r[valid_mask], c_cost[valid_mask]
         cand_angle = np.arctan2(c_y - our_y, c_x - our_x)
 
@@ -320,8 +327,6 @@ class EvasionCalculator(Node):
             scores = np.where(cost_decrease > 0, scores + (cost_decrease * 4.0), scores)
         scores = np.where(c_cost == 0, scores + 35.0, scores)
 
-        # --- FORWARD ONLY LOCK ---
-        # Severe penalty for points behind the robot
         turn_penalty = np.abs(np.arctan2(np.sin(cand_angle - our_yaw), np.cos(cand_angle - our_yaw)))
         is_behind = turn_penalty > np.deg2rad(100.0)
         scores = np.where(is_behind, scores - 500.0, scores)
@@ -343,7 +348,7 @@ class EvasionCalculator(Node):
             tx, ty, t_angle, t_base_score = c_x[idx], c_y[idx], cand_angle[idx], scores[idx]
             
             allow_dogleg = (rank < 4)
-            is_clear, path_type = self.check_path_feasibility(our_x, our_y, tx, ty, effective_max_cost, enable_dogleg=allow_dogleg)
+            is_clear, path_type = self.check_path_feasibility(our_x, our_y, tx, ty, effective_max_cost, enemy_x, enemy_y, enable_dogleg=allow_dogleg)
             
             if is_clear:
                 final_score = t_base_score + (15.0 if path_type == 'STRAIGHT' else 0.0)
@@ -369,32 +374,72 @@ class EvasionCalculator(Node):
         cand_y = global_y + (r_grid * np.sin(a_grid)).flatten()
         
         costs = self.get_cell_costs_vectorized(cand_x, cand_y)
+        dists_to_enemy = np.hypot(cand_x - enemy_x, cand_y - enemy_y)
+        
         valid_mask = costs < MAX_EMERGENCY_COST
+        self.get_logger().warn("RUNNING the EMERGENCY PATH METHOD!")
 
         if np.any(valid_mask):
-            valid_x, valid_y, valid_costs = cand_x[valid_mask], cand_y[valid_mask], costs[valid_mask]
+            valid_x = cand_x[valid_mask]
+            valid_y = cand_y[valid_mask]
+            valid_costs = costs[valid_mask]
+            valid_dists = dists_to_enemy[valid_mask]
             
-            # --- FORWARD ONLY LOCK ---
             cand_angles = np.arctan2(valid_y - global_y, valid_x - global_x)
             turn_diff = np.abs(np.arctan2(np.sin(cand_angles - our_yaw), np.cos(cand_angles - our_yaw)))
-            forward_mask = turn_diff <= np.deg2rad(100.0)
             
+            # --- PHASE 1: Attempt standard forward emergency escape ---
+            forward_mask = turn_diff <= np.deg2rad(100.0)
             if np.any(forward_mask):
-                valid_x = valid_x[forward_mask]
-                valid_y = valid_y[forward_mask]
-                valid_costs = valid_costs[forward_mask]
+                f_x = valid_x[forward_mask]
+                f_y = valid_y[forward_mask]
+                f_costs = valid_costs[forward_mask]
+                f_dists = valid_dists[forward_mask]
 
-                dist_to_enemy = np.hypot(valid_x - enemy_x, valid_y - enemy_y)
-                scores = (dist_to_enemy * 25.0) - (valid_costs * 1.5)
+                start_dist = math.hypot(global_x - enemy_x, global_y - enemy_y)
+                safe_emergency_mask = ~((f_dists < ENEMY_FORCE_FIELD_DIST) & (f_dists < start_dist))
                 
-                best_idx = np.argmax(scores)
-                best_x, best_y = valid_x[best_idx], valid_y[best_idx]
-                best_yaw = math.atan2(best_y - global_y, best_x - global_x)
-                return best_x, best_y, best_yaw
+                if np.any(safe_emergency_mask):
+                    f_x = f_x[safe_emergency_mask]
+                    f_y = f_y[safe_emergency_mask]
+                    f_costs = f_costs[safe_emergency_mask]
+                    f_dists = f_dists[safe_emergency_mask]
 
-        # NO BACKING UP: Spin in place 90 degrees to scan for an opening
-        escape_yaw = our_yaw + (math.pi / 2.0)
-        return global_x, global_y, escape_yaw
+                    scores = (f_dists * 25.0) - (f_costs * 1.5)
+                    best_idx = np.argmax(scores)
+                    best_x, best_y = f_x[best_idx], f_y[best_idx]
+                    best_yaw = math.atan2(best_y - global_y, best_x - global_x)
+                    return best_x, best_y, best_yaw
+
+            # --- PHASE 2: Intelligent 360 Rotation Search (If forward is entirely blocked) ---
+            self.get_logger().warn("[EMERGENCY] Forward blocked! Searching 360 for rotation escape.")
+            start_dist = math.hypot(global_x - enemy_x, global_y - enemy_y)
+            safe_360_mask = ~((valid_dists < ENEMY_FORCE_FIELD_DIST) & (valid_dists < start_dist))
+            
+            if np.any(safe_360_mask):
+                v_x = valid_x[safe_360_mask]
+                v_y = valid_y[safe_360_mask]
+                v_costs = valid_costs[safe_360_mask]
+                v_dists = valid_dists[safe_360_mask]
+
+                scores = (v_dists * 25.0) - (v_costs * 1.5)
+                best_idx = np.argmax(scores)
+                
+                best_x, best_y = v_x[best_idx], v_y[best_idx]
+                best_yaw = math.atan2(best_y - global_y, best_x - global_x)
+                
+                # Project a close target (0.6m) to force the rotation
+                spin_x = global_x + 0.6 * math.cos(best_yaw)
+                spin_y = global_y + 0.6 * math.sin(best_yaw)
+                return spin_x, spin_y, best_yaw
+
+        # --- PHASE 3: Absolute Last Resort (Completely Trapped) ---
+        self.get_logger().warn("[EMERGENCY] Completely trapped! Spinning away from enemy.")
+        angle_to_enemy = math.atan2(enemy_y - global_y, enemy_x - global_x)
+        escape_yaw = angle_to_enemy + math.pi # Spin 180 away from enemy
+        spin_x = global_x + 0.6 * math.cos(escape_yaw)
+        spin_y = global_y + 0.6 * math.sin(escape_yaw)
+        return spin_x, spin_y, escape_yaw
 
     def control_loop(self):
         now = self.get_clock().now().nanoseconds / 1e9
@@ -435,8 +480,16 @@ class EvasionCalculator(Node):
         enemy_global_y = tf_enemy_global.transform.translation.y
         enemy_global_yaw = self.get_yaw_from_quaternion(tf_enemy_global.transform.rotation)
 
+        # Check center cost
         current_cost = self.get_cell_cost(global_x, global_y)
-        is_stuck = current_cost >= MAX_SAFE_COST
+        
+        # Check front bumper cost (projected 0.25m ahead)
+        front_x = global_x + 0.25 * math.cos(our_yaw)
+        front_y = global_y + 0.25 * math.sin(our_yaw)
+        front_cost = self.get_cell_cost(front_x, front_y)
+
+        # Trigger recovery if EITHER the center or the bumper hits the wall
+        is_stuck = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
 
         if is_stuck:
             target_x, target_y, target_yaw = self.get_stuck_recovery_target(
@@ -451,15 +504,17 @@ class EvasionCalculator(Node):
                 global_x, global_y, our_yaw, enemy_global_x, enemy_global_y, enemy_global_yaw
             )
 
+            is_emergency = False
             if best_target is None or max_score < -25.0:
                 if now - self.last_log_time > LOG_THROTTLE_SEC:
                     self.get_logger().warn(f"[EVASION CALCULATOR] Standard paths blocked. EMERGENCY ESCAPE.")
                     self.last_log_time = now
                 target_x, target_y, target_yaw = self.execute_emergency_escape(global_x, global_y, enemy_global_x, enemy_global_y, our_yaw)
+                is_emergency = True
             else:
                 target_x, target_y, target_yaw = best_target
 
-            if self.last_target_x is not None and self.last_target_y is not None:
+            if not is_emergency and self.last_target_x is not None and self.last_target_y is not None:
                 alpha = 0.5
                 target_x = alpha * target_x + (1.0 - alpha) * self.last_target_x
                 target_y = alpha * target_y + (1.0 - alpha) * self.last_target_y
