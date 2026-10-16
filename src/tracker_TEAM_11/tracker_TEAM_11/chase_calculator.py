@@ -11,7 +11,7 @@ from geometry_msgs.msg import TransformStamped
 LOOP_RATE_SEC = 0.033
 
 COSTMAP_MARGIN_CELLS = 6        
-MAX_SAFE_COST = 90              
+MAX_SAFE_COST = 70              
 
 CAPTURE_ORIENT_DIST = 0.35      
 MIN_YAW_UPDATE_DIST = 0.15      
