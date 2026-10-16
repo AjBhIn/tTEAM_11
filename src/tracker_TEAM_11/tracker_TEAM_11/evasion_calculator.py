@@ -13,8 +13,8 @@ LOOP_RATE_SEC = 0.033
 
 # Costmap & Map Boundaries
 COSTMAP_MARGIN_CELLS = 6        # Was 15; reduced to allow fleeing closer to arena edges
-MAX_SAFE_COST = 75              # Was 40; increased so bot can squeeze through inflated crate gaps
-MAX_EMERGENCY_COST = 89         # Absolute maximum cost allowed before hitting a lethal obstacle (100)
+MAX_SAFE_COST = 80              # Was 40; increased so bot can squeeze through inflated crate gaps
+MAX_EMERGENCY_COST = 90         # Absolute maximum cost allowed before hitting a lethal obstacle (100)
 
 # Evasion Trigger Distances
 CLOSE_THREAT_DIST = 1.2         # Distance at which weights heavily shift to prioritize pure escape speed
