@@ -5,16 +5,16 @@ import tf2_ros
 from geometry_msgs.msg import TransformStamped
 
 # --- GLOBAL TUNING VARIABLES ---
-# Reduced from 1.0m to avoid the 0.35m costmap inflation zones rejecting the goal[cite: 2, 3, 10].
+# Reduced from 1.0m to 0.45m to keep the target clear of massive 0.35m costmap inflation zones.
 DEFAULT_DISTANCE_BEHIND = 0.45 
-# TF broadcast rate (~30Hz) for smooth target tracking
+# TF broadcast rate (~30Hz) for smooth, high-fidelity target tracking
 BROADCAST_RATE_SEC = 1.0 / 30.0 
 
 class TargetPointBroadcaster(Node):
     """
-    Broadcasts the ideal 'capture' target point relative to the enemy robot.
-    Places a TF frame directly behind the enemy, optimized to ensure it falls 
-    outside of lethal costmap zones while remaining close enough to trigger a capture.
+    Broadcasts the theoretical 'Carrot' or capture target point relative to the enemy robot.
+    Places a continuous TF frame exactly behind the enemy's rear axis, optimized to 
+    remain within strike distance but outside of lethal inflation ranges.
     """
     def __init__(self):
         super().__init__('target_point_broadcaster')
@@ -40,6 +40,7 @@ class TargetPointBroadcaster(Node):
         # --- TF2 Broadcaster & Timer ---
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.timer = self.create_timer(BROADCAST_RATE_SEC, self.broadcast_target_frame)
+        self.get_logger().info(f"[KILL POSE] Initialized. Broadcasting target {self.distance_behind}m behind enemy.")
 
     def broadcast_target_frame(self):
         t = TransformStamped()
@@ -53,7 +54,7 @@ class TargetPointBroadcaster(Node):
         t.transform.translation.y = 0.0
         t.transform.translation.z = 0.0
         
-        # Align orientation perfectly with the enemy
+        # Align orientation perfectly parallel with the enemy's heading
         t.transform.rotation.w = 1.0
 
         self.tf_broadcaster.sendTransform(t)

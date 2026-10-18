@@ -8,17 +8,21 @@ import tf2_ros
 # --- GLOBAL TUNING VARIABLES ---
 CONTROL_LOOP_RATE_SEC = 0.033
 
+# Evaluates danger differently based on where we are relative to the enemy. 
+# Front approach triggers evasion far away (1.2m), rear approach allows getting close (0.25m).
 BASE_DANGER_THRESHOLD_FRONT = 1.2  
 BASE_DANGER_THRESHOLD_REAR = 0.25   
 
 # --- EVASION LOCK VARIABLES ---
-REPOSITION_CLEAR_DIST = 2.0        # Must be at least 2.0m away
-REPOSITION_CLEAR_ANGLE = 120.0     # Must be securely behind the enemy's front view
+REPOSITION_CLEAR_DIST = 2.0        # Must physically achieve 2.0m distance to end evasion
+REPOSITION_CLEAR_ANGLE = 120.0     # Must secure an angle >= 120deg (rear pocket) to end evasion
 
+# Predictive velocity buffers
 FAST_APPROACH_SPEED = 0.2
 FAST_RETREAT_SPEED = -0.2
 MAX_PREDICTIVE_BUFFER = 0.8
 
+# Offensive Commit Zones
 STRIKE_ZONE_DIST = 1.2             
 STRIKE_ZONE_ANGLE_DEG = 135.0      
 STRIKE_ZONE_BUFFER_DIST = 0.3      
@@ -29,6 +33,11 @@ COOLDOWN_DURATION_SEC = 5.0
 TF_TIMEOUT_SEC = 2.5               
 
 class StateMachine(Node):
+    """
+    High-level operational brain. Analyzes real-time geometry between the robot and enemy,
+    using hysteresis and velocity prediction to transition smoothly between CHASING, 
+    STRIKING, EVADING, and COOLDOWN states.
+    """
     def __init__(self):
         super().__init__('state_machine')
 
@@ -57,15 +66,17 @@ class StateMachine(Node):
         state_topic = f'/{self.robot_ns}/robot_state' if self.robot_ns else '/robot_state'
         self.state_pub = self.create_publisher(String, state_topic, 10)
 
+        # Temporal trackers
         self.last_state_change_time = None
         self.last_tf_success_time = None
         self.last_enemy_dist = None
         self.last_eval_time = None
 
         self.timer = self.create_timer(CONTROL_LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[STATE MACHINE] Initialized. Strict 2m Rear Repositioning Active.")
+        self.get_logger().info("[STATE MACHINE] Successfully Initialized. Strict 2.0m Evasion Clearance Active.")
 
     def get_pursuer_in_enemy_frame(self):
+        """Calculates our precise Cartesian location localized entirely to the enemy's POV."""
         try:
             trans = self.tf_buffer.lookup_transform(
                 self.enemy_frame, self.pursuer_frame, rclpy.time.Time()
@@ -75,9 +86,15 @@ class StateMachine(Node):
             return None, None
 
     def evaluate_threat_state(self, rel_x: float, rel_y: float, dt: float):
+        """
+        Calculates the "in_danger" boolean by projecting a dynamic threat-radius bubble.
+        The bubble stretches far in front of the enemy (1.2m) but shrinks to (0.25m) at the rear.
+        Additionally inflates the bubble if the enemy is accelerating rapidly toward us.
+        """
         distance = math.hypot(rel_x, rel_y)
         relative_angle_deg = abs(math.degrees(math.atan2(rel_y, rel_x)))
 
+        # Morphing the shape of the danger threshold based on approach angle
         if relative_angle_deg <= 90.0:
             ratio = relative_angle_deg / 90.0
             base_threshold = BASE_DANGER_THRESHOLD_FRONT - ((BASE_DANGER_THRESHOLD_FRONT - BASE_DANGER_THRESHOLD_REAR) * ratio)
@@ -91,9 +108,11 @@ class StateMachine(Node):
         self.last_enemy_dist = distance
 
         current_threshold = base_threshold
+        # Predictive inflation: Expand the threshold if the enemy is diving at us fast
         if approach_speed > FAST_APPROACH_SPEED:
             predictive_buffer = min(MAX_PREDICTIVE_BUFFER, approach_speed * 0.5) 
             current_threshold += predictive_buffer
+        # Predictive deflation: If enemy is driving away, we can get slightly closer safely
         elif approach_speed < FAST_RETREAT_SPEED:
             current_threshold -= 0.2
 
@@ -113,9 +132,10 @@ class StateMachine(Node):
 
         rel_x, rel_y = self.get_pursuer_in_enemy_frame()
         
+        # TF Drop protection: Force default state if data stops flowing
         if rel_x is None: 
             if current_time_sec - (self.last_tf_success_time.nanoseconds / 1e9) > TF_TIMEOUT_SEC and self.state != 'CHASING':
-                self.get_logger().warn(f"[STATE MACHINE] TF Data lost. Reverting to CHASING.")
+                self.get_logger().error(f"[STATE MACHINE] TF Data lost. Aborting {self.state} and defaulting to CHASING.")
                 self.state = 'CHASING'
                 self.last_state_change_time = now
                 self.last_enemy_dist = None  
@@ -130,53 +150,57 @@ class StateMachine(Node):
         rel_angle_deg = abs(math.degrees(math.atan2(rel_y, rel_x)))
         time_in_state = current_time_sec - (self.last_state_change_time.nanoseconds / 1e9)
 
+        # --- STATE MACHINE EVALUATION LOGIC ---
         if self.state == 'COOLDOWN':
             if in_danger:
-                self.get_logger().warn(f'[STATE MACHINE] Threatened! Breaking Cooldown -> EVADING.')
+                self.get_logger().warn(f'[STATE MACHINE] Under attack during Cooldown! Forcing EVADING.')
                 self.state = 'EVADING'
                 self.last_state_change_time = now
             elif time_in_state >= COOLDOWN_DURATION_SEC:
-                self.get_logger().info('[STATE MACHINE] Cooldown complete. Resuming CHASING.')
+                self.get_logger().info('[STATE MACHINE] Cooldown complete. Resuming offensive CHASING.')
                 self.state = 'CHASING'
                 self.last_state_change_time = now
 
         elif self.state == 'CHASING':
             if in_danger:
-                self.get_logger().warn(f'[STATE MACHINE] Danger detected. Switching -> EVADING.')
+                self.get_logger().warn(f'[STATE MACHINE] Physical Threat Triggered (Dist: {dist:.2f}m). Switching to EVADING.')
                 self.state = 'EVADING'
                 self.last_state_change_time = now
             elif dist <= STRIKE_ZONE_DIST and rel_angle_deg >= STRIKE_ZONE_ANGLE_DEG:
-                self.get_logger().info(f'[STATE MACHINE] In Strike Zone. Committing to STRIKING!')
+                self.get_logger().info(f'[STATE MACHINE] Rear Pocket Secured (Angle: {rel_angle_deg:.1f}deg). Committing to STRIKING!')
                 self.state = 'STRIKING'
                 self.last_state_change_time = now
 
         elif self.state == 'STRIKING':
             if dist <= CAPTURE_DISTANCE:
-                self.get_logger().info(f'[STATE MACHINE] Target captured! Entering COOLDOWN ({COOLDOWN_DURATION_SEC}s).')
+                self.get_logger().info(f'[STATE MACHINE] >> SUCCESSFUL CAPTURE << Halting offense for COOLDOWN ({COOLDOWN_DURATION_SEC}s).')
                 self.state = 'COOLDOWN'
                 self.last_state_change_time = now
             elif in_danger:
-                self.get_logger().warn(f'[STATE MACHINE] Counterattack during strike -> EVADING.')
+                self.get_logger().warn(f'[STATE MACHINE] Enemy countered during Strike. Breaking off to EVADING.')
                 self.state = 'EVADING'
                 self.last_state_change_time = now
+            # Abort Strike if enemy slips out of the extended spatial buffer
             elif dist > (STRIKE_ZONE_DIST + STRIKE_ZONE_BUFFER_DIST) or rel_angle_deg < (STRIKE_ZONE_ANGLE_DEG - STRIKE_ZONE_BUFFER_ANGLE):
-                self.get_logger().info('[STATE MACHINE] Enemy pulled away. Aborting strike -> CHASING.')
+                self.get_logger().info('[STATE MACHINE] Enemy broke pocket lock. Aborting Strike -> Reverting to CHASING.')
                 self.state = 'CHASING'
                 self.last_state_change_time = now
 
         elif self.state == 'EVADING':
+            # Evading lock requires both massive distance and a safe rear-angle location to conclude.
             is_safely_behind = (rel_angle_deg >= REPOSITION_CLEAR_ANGLE)
             is_at_safe_distance = (dist >= REPOSITION_CLEAR_DIST)
             
-            # Print evaluation criteria occasionally for debugging
-            if int(now.nanoseconds / 1e9 * 30) % 30 == 0:  # Logs ~1 time per second
-                self.get_logger().info(f"[STATE MACHINE] Evaluating Evasion - Dist: {dist:.2f}m (Need {REPOSITION_CLEAR_DIST}m), Angle: {rel_angle_deg:.1f}deg (Need {REPOSITION_CLEAR_ANGLE}deg)")
+            # Print evaluation criteria cleanly once per second to prevent log spam
+            if int(now.nanoseconds / 1e9 * 30) % 30 == 0:
+                self.get_logger().info(f"[STATE MACHINE] Evasion Status - Distance: {dist:.2f}m (Target {REPOSITION_CLEAR_DIST}m) | Angle: {rel_angle_deg:.1f}° (Target {REPOSITION_CLEAR_ANGLE}°)")
             
             if is_safely_behind and is_at_safe_distance:
-                self.get_logger().info(f'[STATE MACHINE] Successfully cleared 2.0m behind enemy. Resuming CHASING.')
+                self.get_logger().info(f'[STATE MACHINE] Evasion Checkpoints Cleared. Distance & Angle secured. Resuming CHASING.')
                 self.state = 'CHASING'
                 self.last_state_change_time = now
 
+        # Broadcast the verified state so calculater nodes can listen
         msg = String()
         msg.data = self.state
         self.state_pub.publish(msg)
