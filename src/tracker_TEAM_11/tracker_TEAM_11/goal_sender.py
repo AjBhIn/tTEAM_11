@@ -91,7 +91,7 @@ class GoalSender(Node):
         self.nav_client = ActionClient(self, NavigateToPose, self.action_name)
         
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[GOAL SENDER] Ready. Universal Bypass and verbose logging active.")
+        self.get_logger().info("[GOAL SENDER] Ready. Global Opportunistic Capture Active.")
 
     def image_callback(self, msg):
         self.tracker_image = msg
@@ -156,20 +156,19 @@ class GoalSender(Node):
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
 
-        if self.state in ['STRIKING', 'COOLDOWN']:
-            try:
-                rel_tf = self.tf_buffer.lookup_transform(
-                    self.robot_frame, self.enemy_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
-                )
-                rel_dist = math.hypot(rel_tf.transform.translation.x, rel_tf.transform.translation.y)
-                if rel_dist <= CAPTURE_DISTANCE_M:
-                    rel_orient = self.get_yaw_from_quaternion(rel_tf.transform.rotation)
-                    self.trigger_capture_report(rel_dist, rel_orient)
-            except tf2_ros.TransformException:
-                pass
+        # Global capture logic: Fires photo instantly if enemy is close, regardless of current state.
+        try:
+            rel_tf = self.tf_buffer.lookup_transform(
+                self.robot_frame, self.enemy_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
+            )
+            rel_dist = math.hypot(rel_tf.transform.translation.x, rel_tf.transform.translation.y)
+            if rel_dist <= CAPTURE_DISTANCE_M:
+                rel_orient = self.get_yaw_from_quaternion(rel_tf.transform.rotation)
+                self.trigger_capture_report(rel_dist, rel_orient)
+        except tf2_ros.TransformException:
+            pass
 
         if self.force_update:
-            # We bypass the throttle completely to abort the old path
             self.is_goal_pending = False
 
         if self.is_goal_pending: 
@@ -178,22 +177,18 @@ class GoalSender(Node):
             else:
                 return
 
-        # Listen to custom evasion file during EVADING, chaser file during OFFENSE
         target_frame = self.escape_frame if self.state == 'EVADING' else self.chase_frame
         try:
             target_tf = self.tf_buffer.lookup_transform(
                 self.map_frame, target_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
             )
-        except tf2_ros.TransformException as e:
-            # THIS IS CRITICAL: If the goal sender drops goals, this log tells us why!
-            # self.get_logger().debug(f"[GOAL SENDER] Missing TF for {target_frame}: {e}")
+        except tf2_ros.TransformException:
             return
 
         t_x = target_tf.transform.translation.x
         t_y = target_tf.transform.translation.y
         t_rot = target_tf.transform.rotation
 
-        # Throttle logic ensures we don't spam Nav2 over WiFi unless the goal actually moved
         if not self.force_update and self.last_sent_pose is not None:
             dist_moved = math.hypot(t_x - self.last_sent_pose.pose.position.x, t_y - self.last_sent_pose.pose.position.y)
             time_elapsed = now_sec - self.last_goal_time
@@ -205,7 +200,6 @@ class GoalSender(Node):
             if dist_moved < MIN_GOAL_MOVE_DIST and yaw_change < MIN_GOAL_YAW_CHANGE and time_elapsed < MIN_GOAL_TIME_ELAPSED:
                 return
 
-        # If we reach here, we are successfully sending a goal!
         self.force_update = False
         self.get_logger().info(f"[GOAL SENDER] Dispatching New Goal to Nav2 -> Target: {target_frame}")
 
