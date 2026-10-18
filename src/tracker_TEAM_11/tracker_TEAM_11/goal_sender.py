@@ -1,3 +1,4 @@
+# goal_sender_2.py
 #!/usr/bin/env python3
 import math
 import rclpy
@@ -25,10 +26,11 @@ ACTION_SERVER_TIMEOUT = 1.0
 CAPTURE_DISTANCE_M = 0.50         
 CAPTURE_COOLDOWN_SEC = 4.8        
 
-# Throttling parameters: Prevent spamming Nav2 with rapid identical goal requests
-MIN_GOAL_MOVE_DIST = 0.35         
+# [OPTIMIZED]: Decreased distance/time thresholds to force rapid 
+# Nav2 trajectory updates, making the robot drastically more responsive.
+MIN_GOAL_MOVE_DIST = 0.25         
 MIN_GOAL_YAW_CHANGE = math.radians(15.0)
-MIN_GOAL_TIME_ELAPSED = 0.60
+MIN_GOAL_TIME_ELAPSED = 0.40
 
 class GoalSender(Node):
     """
@@ -100,7 +102,7 @@ class GoalSender(Node):
         self.nav_client = ActionClient(self, NavigateToPose, self.action_name)
         
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[GOAL SENDER] Successfully Initialized. Global Opportunistic Capture Active.")
+        self.get_logger().info("[GOAL SENDER] High-Agility Throttling Active. Ready to intercept targets.")
 
     def image_callback(self, msg):
         self.tracker_image = msg
@@ -223,7 +225,7 @@ class GoalSender(Node):
 
         # Commit to sending the Goal Action to Nav2
         self.force_update = False
-        self.get_logger().info(f"[GOAL SENDER] Dispatching New Coordinate Vector to Nav2 -> Target: {target_frame}")
+        self.get_logger().debug(f"[GOAL SENDER] Dispatching New Coordinate Vector to Nav2 -> Target: {target_frame}")
 
         goal = PoseStamped()
         goal.header.frame_id = self.map_frame

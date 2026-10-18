@@ -1,3 +1,4 @@
+# evasion_calculator_2.py
 #!/usr/bin/env python3
 import math
 import rclpy
@@ -101,7 +102,7 @@ class EvasionCalculator(Node):
         self.last_tf_time = 0.0 
 
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[EVASION CALCULATOR] Initialized. 360 Emergency Rotation Active.")
+        self.get_logger().info("[EVASION CALCULATOR] Initialized. CPU-Optimized Line-of-Sight Active.")
 
     def state_cb(self, msg):
         self.current_state = msg.data
@@ -205,8 +206,8 @@ class EvasionCalculator(Node):
     def is_path_clear(self, start_x: float, start_y: float, end_x: float, end_y: float, max_cost: int, e_x: float, e_y: float) -> bool:
         """
         Validates if an interpolated line from start to end is safe.
-        Uses Costmap validation AND the 'Expanding Distance Rule' to reject paths that 
-        physically intersect the enemy chassis.
+        [OPTIMIZED]: Replaced heavy NumPy allocations with a pure Python fail-fast loop.
+        Massively reduces garbage collection spikes during 30Hz evaluation.
         """
         if self.map_data is None: return False
         dist = math.hypot(end_x - start_x, end_y - start_y)
@@ -219,31 +220,24 @@ class EvasionCalculator(Node):
         step_size = 0.10 if dist <= 0.8 else 0.05
         steps = max(2, int(dist / step_size))
 
-        t = np.linspace(0.0, 1.0, steps)
-        px = start_x + t * (end_x - start_x)
-        py = start_y + t * (end_y - start_y)
+        dx = (end_x - start_x) / steps
+        dy = (end_y - start_y) / steps
 
-        # SMART GEOMETRIC CHECK: Expanding Distance Rule
-        # If any point on the path enters the 0.45m force field AND brings us closer to the enemy 
-        # than we started, instantly reject it. Protects against Costmap Lag.
-        dist_to_enemy_arr = np.hypot(px - e_x, py - e_y)
-        if np.any((dist_to_enemy_arr < ENEMY_FORCE_FIELD_DIST) & (dist_to_enemy_arr < start_dist_to_enemy)):
-            return False
+        for i in range(1, steps + 1):
+            px = start_x + dx * i
+            py = start_y + dy * i
 
-        # Standard Costmap Evaluation
-        raw_cols = ((px - self.map_origin_x) / self.map_res).astype(np.int32)
-        raw_rows = ((py - self.map_origin_y) / self.map_res).astype(np.int32)
+            # 1. SMART GEOMETRIC CHECK: Expanding Distance Rule
+            # If any point enters the 0.45m force field AND brings us closer to enemy, fail immediately.
+            dist_to_enemy = math.hypot(px - e_x, py - e_y)
+            if dist_to_enemy < ENEMY_FORCE_FIELD_DIST and dist_to_enemy < start_dist_to_enemy:
+                return False
 
-        if np.any(raw_cols < COSTMAP_MARGIN_CELLS) or np.any(raw_cols >= (self.map_width - COSTMAP_MARGIN_CELLS)) or \
-           np.any(raw_rows < COSTMAP_MARGIN_CELLS) or np.any(raw_rows >= (self.map_height - COSTMAP_MARGIN_CELLS)):
-            return False
+            # 2. STANDARD COSTMAP CHECK
+            if self.get_cell_cost(px, py) > max_cost:
+                return False
 
-        cols = np.clip(raw_cols, 0, self.map_width - 1)
-        rows = np.clip(raw_rows, 0, self.map_height - 1)
-        indices = rows * self.map_width + cols
-        costs = self.map_data[indices]
-
-        return not (np.any(costs > max_cost) or np.any(costs == -1))
+        return True
 
     def check_path_feasibility(self, start_x, start_y, end_x, end_y, max_cost, e_x, e_y, enable_dogleg=True):
         """Checks direct line of sight. If blocked, attempts a wide 'dogleg' path around the obstacle."""
@@ -490,6 +484,7 @@ class EvasionCalculator(Node):
             return
 
         try:
+            # Requesting latest TF automatically to prevent stale geometry bugs
             tf_global = self.tf_buffer.lookup_transform(self.map_frame, self.robot_frame, rclpy.time.Time())
             tf_enemy_global = self.tf_buffer.lookup_transform(self.map_frame, self.enemy_frame, rclpy.time.Time())
             self.last_tf_time = now

@@ -1,3 +1,4 @@
+# state_machine_2.py
 #!/usr/bin/env python3
 import math
 import rclpy
@@ -31,6 +32,10 @@ CAPTURE_DISTANCE = 0.5
 COOLDOWN_DURATION_SEC = 5.0        
 
 TF_TIMEOUT_SEC = 2.5               
+
+# [OPTIMIZED]: Global debounce. Prevents the state machine from instantly 
+# fluttering between CHASING and EVADING due to tiny sensor noise at the boundary.
+MIN_STATE_LOCK_SEC = 0.5
 
 class StateMachine(Node):
     """
@@ -73,7 +78,7 @@ class StateMachine(Node):
         self.last_eval_time = None
 
         self.timer = self.create_timer(CONTROL_LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[STATE MACHINE] Successfully Initialized. Strict 2.0m Evasion Clearance Active.")
+        self.get_logger().info(f"[STATE MACHINE] Initialized. Anti-Flutter Hysteresis Lock ({MIN_STATE_LOCK_SEC}s) Active.")
 
     def get_pursuer_in_enemy_frame(self):
         """Calculates our precise Cartesian location localized entirely to the enemy's POV."""
@@ -150,8 +155,12 @@ class StateMachine(Node):
         rel_angle_deg = abs(math.degrees(math.atan2(rel_y, rel_x)))
         time_in_state = current_time_sec - (self.last_state_change_time.nanoseconds / 1e9)
 
+        # Hysteresis check ensures non-emergency state shifts don't jitter
+        can_transition = (time_in_state >= MIN_STATE_LOCK_SEC)
+
         # --- STATE MACHINE EVALUATION LOGIC ---
         if self.state == 'COOLDOWN':
+            # Danger overrides the lock buffer to keep the bot safe
             if in_danger:
                 self.get_logger().warn(f'[STATE MACHINE] Under attack during Cooldown! Forcing EVADING.')
                 self.state = 'EVADING'
@@ -166,7 +175,7 @@ class StateMachine(Node):
                 self.get_logger().warn(f'[STATE MACHINE] Physical Threat Triggered (Dist: {dist:.2f}m). Switching to EVADING.')
                 self.state = 'EVADING'
                 self.last_state_change_time = now
-            elif dist <= STRIKE_ZONE_DIST and rel_angle_deg >= STRIKE_ZONE_ANGLE_DEG:
+            elif dist <= STRIKE_ZONE_DIST and rel_angle_deg >= STRIKE_ZONE_ANGLE_DEG and can_transition:
                 self.get_logger().info(f'[STATE MACHINE] Rear Pocket Secured (Angle: {rel_angle_deg:.1f}deg). Committing to STRIKING!')
                 self.state = 'STRIKING'
                 self.last_state_change_time = now
@@ -181,13 +190,13 @@ class StateMachine(Node):
                 self.state = 'EVADING'
                 self.last_state_change_time = now
             # Abort Strike if enemy slips out of the extended spatial buffer
-            elif dist > (STRIKE_ZONE_DIST + STRIKE_ZONE_BUFFER_DIST) or rel_angle_deg < (STRIKE_ZONE_ANGLE_DEG - STRIKE_ZONE_BUFFER_ANGLE):
+            elif (dist > (STRIKE_ZONE_DIST + STRIKE_ZONE_BUFFER_DIST) or rel_angle_deg < (STRIKE_ZONE_ANGLE_DEG - STRIKE_ZONE_BUFFER_ANGLE)) and can_transition:
                 self.get_logger().info('[STATE MACHINE] Enemy broke pocket lock. Aborting Strike -> Reverting to CHASING.')
                 self.state = 'CHASING'
                 self.last_state_change_time = now
 
         elif self.state == 'EVADING':
-            # Evading lock requires both massive distance and a safe rear-angle location to conclude.
+            # Evading lock requires massive distance, a safe rear-angle location, AND time duration to conclude.
             is_safely_behind = (rel_angle_deg >= REPOSITION_CLEAR_ANGLE)
             is_at_safe_distance = (dist >= REPOSITION_CLEAR_DIST)
             
@@ -195,12 +204,12 @@ class StateMachine(Node):
             if int(now.nanoseconds / 1e9 * 30) % 30 == 0:
                 self.get_logger().info(f"[STATE MACHINE] Evasion Status - Distance: {dist:.2f}m (Target {REPOSITION_CLEAR_DIST}m) | Angle: {rel_angle_deg:.1f}° (Target {REPOSITION_CLEAR_ANGLE}°)")
             
-            if is_safely_behind and is_at_safe_distance:
+            if is_safely_behind and is_at_safe_distance and can_transition:
                 self.get_logger().info(f'[STATE MACHINE] Evasion Checkpoints Cleared. Distance & Angle secured. Resuming CHASING.')
                 self.state = 'CHASING'
                 self.last_state_change_time = now
 
-        # Broadcast the verified state so calculater nodes can listen
+        # Broadcast the verified state so calculator nodes can listen
         msg = String()
         msg.data = self.state
         self.state_pub.publish(msg)
