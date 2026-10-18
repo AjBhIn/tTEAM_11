@@ -86,7 +86,7 @@ class ChaserCalculator(Node):
         self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_cb, 10)
 
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[CHASER CALCULATOR] Initialized with Vectorized Offensive Stuck Recovery.")
+        self.get_logger().info("[CHASER CALCULATOR] Initialized with Bumper-Aware Trigger and Robust Stuck Recovery.")
 
     def state_cb(self, msg):
         self.current_state = msg.data
@@ -178,13 +178,18 @@ class ChaserCalculator(Node):
             cross_product = math.cos(our_yaw) * math.sin(angle_to_enemy) - math.sin(our_yaw) * math.cos(angle_to_enemy)
             spin_dir = -1.0 if cross_product > 0 else 1.0
             best_escape_yaw = our_yaw + (spin_dir * math.pi / 2.0)
-            return our_x, our_y, best_escape_yaw
+            
+            # FIX 1: Project goal outward so Nav2 actually drives the robot out, rather than spinning in place
+            spin_x = our_x + 0.6 * math.cos(best_escape_yaw)
+            spin_y = our_y + 0.6 * math.sin(best_escape_yaw)
+            return spin_x, spin_y, best_escape_yaw
 
         best_idx = np.argmax(np.where(valid_angles, scores, -1e9))
         best_escape_yaw = float(probe_angles[best_idx])
 
         # Project goal outward into free space
-        escape_dist = STUCK_ESCAPE_DIST
+        # FIX 2: Default to the closest target (0.6m) instead of failing at 1.2m if the inflation zone is thick
+        escape_dist = 0.6 
         for d in (1.2, 1.0, 0.8, 0.6):
             tx = our_x + d * math.cos(best_escape_yaw)
             ty = our_y + d * math.sin(best_escape_yaw)
@@ -207,7 +212,6 @@ class ChaserCalculator(Node):
         dist = math.hypot(target_x - p_x, target_y - p_y)
 
         self.get_logger().warn("RUNNING the STRAIGHT CHASER PAHT METHOD!")
-
         
         if dist < 0.05 or self.current_state == 'STRIKING':
             return target_x, target_y
@@ -385,16 +389,22 @@ class ChaserCalculator(Node):
 
         # --- DYNAMIC STUCK RECOVERY CHECK ---
         current_cost = self.get_cell_cost(p_x, p_y)
+        
+        # FIX 3: Check front bumper cost (projected 0.25m ahead) to detect walls before the center hits them
+        front_x = p_x + 0.25 * math.cos(our_yaw)
+        front_y = p_y + 0.25 * math.sin(our_yaw)
+        front_cost = self.get_cell_cost(front_x, front_y)
+
         dist_to_safe = math.hypot(safe_x - p_x, safe_y - p_y)
         
-        # Trigger if physically in high cost, OR if the path is blocked (pulled back to < 0.25m) while chasing
+        # Trigger if physically in high cost (center OR bumper), OR if the path is blocked (pulled back to < 0.25m) while chasing
         target_collapsed = (dist_to_safe < 0.25) and (dist_to_enemy > 0.60)
-        is_stuck = (current_cost >= MAX_SAFE_COST or target_collapsed) and (self.current_state == 'CHASING')
+        is_stuck = (current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST or target_collapsed) and (self.current_state == 'CHASING')
         should_log = (now_sec - self.last_log_time > LOG_THROTTLE_SEC)
 
         if is_stuck:
             if should_log:
-                reason = "High Costmap Elevation" if current_cost >= MAX_SAFE_COST else "Path Collapsed (Blocked)"
+                reason = "High Costmap Elevation" if (current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST) else "Path Collapsed (Blocked)"
                 self.get_logger().warn(f"[CHASER TRIGGER] Stuck detected via {reason}. Firing Recovery!")
                 
             safe_x, safe_y, safe_yaw = self.get_chaser_stuck_recovery_target(
