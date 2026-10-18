@@ -21,7 +21,7 @@ MIN_YAW_UPDATE_DIST = 0.15
 
 # Tactical Leash & Precision Strike
 CHASE_LEASH_DIST = 0.8          
-STRIKE_TARGET_DIST = 0.40       
+STRIKE_TARGET_DIST = 0.10       
 ORBITAL_FLANK_DIST = 1.2        
 
 MAX_YAW_RATE_SMOOTHING = 1.0    
@@ -74,6 +74,9 @@ class ChaserCalculator(Node):
         self.dive_active_logged = False
         self.was_sleeping = False  
         self.last_log_time = 0.0
+        
+        # State lock to prevent micro-stuttering/wiggling at the 85-cost boundary
+        self.is_recovering = False
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -86,7 +89,7 @@ class ChaserCalculator(Node):
         self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_cb, 10)
 
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[CHASER CALCULATOR] Initialized with Bumper-Aware Trigger and Robust Stuck Recovery.")
+        self.get_logger().info("[CHASER CALCULATOR] Initialized with Anti-Wiggle Lock and Forward Recovery.")
 
     def state_cb(self, msg):
         self.current_state = msg.data
@@ -143,12 +146,6 @@ class ChaserCalculator(Node):
     def get_chaser_stuck_recovery_target(self, our_x: float, our_y: float, our_yaw: float, 
                                          enemy_x: float, enemy_y: float, carrot_x: float, carrot_y: float, 
                                          current_cost: int, should_log: bool):
-        """
-        Vectorized 360-Sweep adapted for CHASING:
-        1. Downhill cost gradient ensures extraction from walls.
-        2. Strict Anti-Ramming penalty avoids looking through the enemy.
-        3. Penalizes distance to the carrot to keep the robot aggressively pursuing the rear pocket.
-        """
         probe_angles = np.linspace(0, 2 * math.pi, 36, endpoint=False)
         probe_x = our_x + 0.6 * np.cos(probe_angles)
         probe_y = our_y + 0.6 * np.sin(probe_angles)
@@ -158,10 +155,10 @@ class ChaserCalculator(Node):
         cost_drop = current_cost - probe_costs
         scores = cost_drop * 15.0
 
-        # 2. Avoid Enemy Center (Prevent ramming through the enemy)
+        # 2. Avoid Enemy Center (Restored 75-degree cone to prevent ramming physical corners)
         angle_to_enemy = math.atan2(enemy_y - our_y, enemy_x - our_x)
         enemy_diff = np.abs(np.arctan2(np.sin(probe_angles - angle_to_enemy), np.cos(probe_angles - angle_to_enemy)))
-        scores = np.where(enemy_diff < np.deg2rad(45.0), scores - 500.0, scores)
+        scores = np.where(enemy_diff < np.deg2rad(75.0), scores - 500.0, scores)
 
         # 3. Stay Offensive (Move toward the rear pocket target)
         dist_to_carrot = np.hypot(probe_x - carrot_x, probe_y - carrot_y)
@@ -174,12 +171,11 @@ class ChaserCalculator(Node):
             self.get_logger().info(f"[CHASER STUCK SWEEP] Robot Cost: {current_cost} | Surrounding: [{', '.join(debug_costs)}]")
 
         if not np.any(valid_angles):
-            # Boxed in! Spin 90 degrees away from the enemy to find an exit.
+            # Boxed in! Calculate escape vector and orient forward to drive out
             cross_product = math.cos(our_yaw) * math.sin(angle_to_enemy) - math.sin(our_yaw) * math.cos(angle_to_enemy)
             spin_dir = -1.0 if cross_product > 0 else 1.0
             best_escape_yaw = our_yaw + (spin_dir * math.pi / 2.0)
             
-            # FIX 1: Project goal outward so Nav2 actually drives the robot out, rather than spinning in place
             spin_x = our_x + 0.6 * math.cos(best_escape_yaw)
             spin_y = our_y + 0.6 * math.sin(best_escape_yaw)
             return spin_x, spin_y, best_escape_yaw
@@ -187,13 +183,12 @@ class ChaserCalculator(Node):
         best_idx = np.argmax(np.where(valid_angles, scores, -1e9))
         best_escape_yaw = float(probe_angles[best_idx])
 
-        # Project goal outward into free space
-        # FIX 2: Default to the closest target (0.6m) instead of failing at 1.2m if the inflation zone is thick
+        # Project goal outward into free space (Restored 0.45m force field to prevent projecting inside enemy)
         escape_dist = 0.6 
         for d in (1.2, 1.0, 0.8, 0.6):
             tx = our_x + d * math.cos(best_escape_yaw)
             ty = our_y + d * math.sin(best_escape_yaw)
-            if self.get_cell_cost(tx, ty) < MAX_SAFE_COST:
+            if self.get_cell_cost(tx, ty) < MAX_SAFE_COST and math.hypot(tx - enemy_x, ty - enemy_y) >= 0.45:
                 escape_dist = d
                 break
 
@@ -202,16 +197,15 @@ class ChaserCalculator(Node):
 
         if should_log:
             self.get_logger().warn(
-                f"[CHASER STUCK RECOVERY] Safe offensive path locked at {math.degrees(best_escape_yaw):.1f}°. "
+                f"[CHASER STUCK RECOVERY] Driving forward out via {math.degrees(best_escape_yaw):.1f}°. "
                 f"Targeting {escape_dist:.2f}m."
             )
 
+        # Return best_escape_yaw so the robot turns and drives forward into the clearing
         return rec_x, rec_y, best_escape_yaw
 
     def truncate_to_line_of_sight(self, p_x: float, p_y: float, target_x: float, target_y: float):
         dist = math.hypot(target_x - p_x, target_y - p_y)
-
-        self.get_logger().warn("RUNNING the STRAIGHT CHASER PAHT METHOD!")
         
         if dist < 0.05 or self.current_state == 'STRIKING':
             return target_x, target_y
@@ -261,8 +255,6 @@ class ChaserCalculator(Node):
                     if score < best_score:
                         best_score = score
                         best_tx, best_ty = tx, ty
-
-        self.get_logger().warn("RUNNING the ARC CHASER PAHT METHOD!")
                         
         return best_tx, best_ty
 
@@ -288,6 +280,7 @@ class ChaserCalculator(Node):
             self.filtered_target_y = None
             self.flank_active_logged = False
             self.dive_active_logged = False
+            self.is_recovering = False
             return
 
         if self.was_sleeping:
@@ -389,17 +382,23 @@ class ChaserCalculator(Node):
 
         # --- DYNAMIC STUCK RECOVERY CHECK ---
         current_cost = self.get_cell_cost(p_x, p_y)
-        
-        # FIX 3: Check front bumper cost (projected 0.25m ahead) to detect walls before the center hits them
         front_x = p_x + 0.25 * math.cos(our_yaw)
         front_y = p_y + 0.25 * math.sin(our_yaw)
         front_cost = self.get_cell_cost(front_x, front_y)
 
         dist_to_safe = math.hypot(safe_x - p_x, safe_y - p_y)
-        
-        # Trigger if physically in high cost (center OR bumper), OR if the path is blocked (pulled back to < 0.25m) while chasing
         target_collapsed = (dist_to_safe < 0.25) and (dist_to_enemy > 0.60)
-        is_stuck = (current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST or target_collapsed) and (self.current_state == 'CHASING')
+        
+        # Lightweight spatial lock to prevent goal thrashing (wiggling) at the boundary
+        if not self.is_recovering:
+            if current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST or target_collapsed:
+                self.is_recovering = True
+        else:
+            # Release recovery as soon as the robot backs up into 74 cost or below (maintains aggression)
+            if current_cost < 75 and front_cost < 75 and not target_collapsed:
+                self.is_recovering = False
+
+        is_stuck = self.is_recovering and (self.current_state == 'CHASING')
         should_log = (now_sec - self.last_log_time > LOG_THROTTLE_SEC)
 
         if is_stuck:
