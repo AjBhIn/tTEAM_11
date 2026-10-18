@@ -1,4 +1,3 @@
-# goal_sender_2.py
 #!/usr/bin/env python3
 import math
 import rclpy
@@ -26,17 +25,18 @@ ACTION_SERVER_TIMEOUT = 1.0
 CAPTURE_DISTANCE_M = 0.50         
 CAPTURE_COOLDOWN_SEC = 4.8        
 
-# [OPTIMIZED]: Decreased distance/time thresholds to force rapid 
-# Nav2 trajectory updates, making the robot drastically more responsive.
+# High agility thresholds to force rapid trajectory updates
 MIN_GOAL_MOVE_DIST = 0.25         
 MIN_GOAL_YAW_CHANGE = math.radians(15.0)
 MIN_GOAL_TIME_ELAPSED = 0.40
 
+# Action server ghost protection
+MAX_PENDING_GOAL_SEC = 1.0
+
 class GoalSender(Node):
     """
     Acts as the bridge between custom dynamic target TFs (chase/evasion) and the Nav2 Action Server.
-    Also handles the Global Opportunistic Capture logic, independently monitoring distance 
-    to fire the camera report anytime the enemy breaches the 0.50m threshold.
+    [OPTIMIZED]: Added asynchronous timeout fallback. Prevents freezing if the Nav2 action server drops packets.
     """
     def __init__(self):
         super().__init__('goal_sender')
@@ -79,7 +79,6 @@ class GoalSender(Node):
         self.active_goal_handle = None
         self.is_goal_pending = False
         
-        # When state shifts, force Nav2 to accept the new path instantly, ignoring throttle rules
         self.force_update = False 
 
         self.tracker_image = None
@@ -102,13 +101,12 @@ class GoalSender(Node):
         self.nav_client = ActionClient(self, NavigateToPose, self.action_name)
         
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
-        self.get_logger().info("[GOAL SENDER] High-Agility Throttling Active. Ready to intercept targets.")
+        self.get_logger().info("[GOAL SENDER] High-Agility Throttling and Server Ghost Protection Active.")
 
     def image_callback(self, msg):
         self.tracker_image = msg
 
     def state_cb(self, msg):
-        """Monitors state machine transitions to force immediate goal routing on change."""
         new_state = msg.data
         if self.state != new_state:
             self.get_logger().info(f"[GOAL SENDER] State shifted: {self.state} -> {new_state}. Bypassing throttle logic!")
@@ -121,7 +119,6 @@ class GoalSender(Node):
         return math.atan2(siny_cosp, cosy_cosp)
 
     def trigger_capture_report(self, rel_dist, rel_orient):
-        """Assembles and publishes the tracker report (camera frame + metadata) to score the point."""
         if not HAS_TRACKER_MSGS or self.tracker_image is None: return
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
@@ -151,7 +148,6 @@ class GoalSender(Node):
             self.get_logger().error(f"[GOAL SENDER] Capture sequence failed: {e}")
 
     def goal_response_callback(self, future):
-        """Validates that Nav2 successfully accepted the goal vector."""
         self.is_goal_pending = False
         try:
             goal_handle = future.result()
@@ -165,14 +161,11 @@ class GoalSender(Node):
             self.active_goal_handle = None
 
     def control_loop(self):
-        """Main Loop: Syncs targets, monitors global capture radius, and sends Nav2 requests."""
         if not self.nav_client.wait_for_server(timeout_sec=ACTION_SERVER_TIMEOUT): 
             return
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
 
-        # --- GLOBAL OPPORTUNISTIC CAPTURE LOGIC ---
-        # Fires photo instantly if enemy breaches 0.50m, regardless of state (even if actively Evading).
         try:
             rel_tf = self.tf_buffer.lookup_transform(
                 self.robot_frame, self.enemy_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
@@ -184,33 +177,29 @@ class GoalSender(Node):
         except tf2_ros.TransformException:
             pass
 
-        # Handle State Override
         if self.force_update:
             self.is_goal_pending = False
 
-        # Timeout check for stuck Action Server states
+        # [OPTIMIZED]: Action server ghosting fallback
         if self.is_goal_pending: 
-            if (now_sec - self.last_goal_time) > 1.0: 
+            if (now_sec - self.last_goal_time) > MAX_PENDING_GOAL_SEC: 
+                self.get_logger().warn("[GOAL SENDER] Action Server timeout! Hard-clearing goal lock.")
                 self.is_goal_pending = False
             else:
                 return
 
-        # Route target selection based on the active State Machine
         target_frame = self.escape_frame if self.state == 'EVADING' else self.chase_frame
         try:
             target_tf = self.tf_buffer.lookup_transform(
                 self.map_frame, target_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.1)
             )
         except tf2_ros.TransformException:
-            # Silent return to avoid log spam, simply waits for TF calculation to catch up
             return
 
         t_x = target_tf.transform.translation.x
         t_y = target_tf.transform.translation.y
         t_rot = target_tf.transform.rotation
 
-        # --- THROTTLE LOGIC ---
-        # Ensures we don't spam Nav2 over WiFi unless the goal actually moved significantly
         if not self.force_update and self.last_sent_pose is not None:
             dist_moved = math.hypot(t_x - self.last_sent_pose.pose.position.x, t_y - self.last_sent_pose.pose.position.y)
             time_elapsed = now_sec - self.last_goal_time
@@ -219,11 +208,9 @@ class GoalSender(Node):
             yaw_last = self.get_yaw_from_quaternion(self.last_sent_pose.pose.orientation)
             yaw_change = abs(math.atan2(math.sin(yaw_current - yaw_last), math.cos(yaw_current - yaw_last)))
 
-            # Only forward the goal to Nav2 if distance, angle, or temporal thresholds are met
             if dist_moved < MIN_GOAL_MOVE_DIST and yaw_change < MIN_GOAL_YAW_CHANGE and time_elapsed < MIN_GOAL_TIME_ELAPSED:
                 return
 
-        # Commit to sending the Goal Action to Nav2
         self.force_update = False
         self.get_logger().debug(f"[GOAL SENDER] Dispatching New Coordinate Vector to Nav2 -> Target: {target_frame}")
 
