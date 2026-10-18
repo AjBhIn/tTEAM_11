@@ -43,6 +43,7 @@ class EvasionCalculator(Node):
     def __init__(self):
         super().__init__('evasion_calculator')
 
+        # Dynamic Namespaces
         raw_ns = self.get_namespace().strip('/')
         default_robot_ns = raw_ns if raw_ns else 'our_bot'
 
@@ -63,7 +64,8 @@ class EvasionCalculator(Node):
         enemy_p = self.get_parameter('enemy_frame').value
         self.enemy_frame = enemy_p if enemy_p else (f'{self.enemy_ns}/base_link' if self.enemy_ns else 'base_link')
         self.target_frame = self.get_parameter('target_frame').value
-        
+
+        # Creating Broadcaster which will be used a goal placer
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
@@ -123,17 +125,21 @@ class EvasionCalculator(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
 
+    # Getting map data from the map publisher
     def costmap_callback(self, msg: OccupancyGrid):
         self.map_data = np.array(msg.data, dtype=np.int16)
         self.map_res = msg.info.resolution
         self.map_width, self.map_height = msg.info.width, msg.info.height
         self.map_origin_x, self.map_origin_y = msg.info.origin.position.x, msg.info.origin.position.y
 
+    # Getting cost value of one px a time
     def get_cell_cost(self, x: float, y: float) -> int:
         if self.map_data is None: return 100
         raw_col = int((x - self.map_origin_x) / self.map_res)
         raw_row = int((y - self.map_origin_y) / self.map_res)
 
+        # Adding a margin so the "goal placer" does place goal
+        # outside the map or on the boundaries of the map
         if raw_col < COSTMAP_MARGIN_CELLS or raw_col >= (self.map_width - COSTMAP_MARGIN_CELLS) or \
            raw_row < COSTMAP_MARGIN_CELLS or raw_row >= (self.map_height - COSTMAP_MARGIN_CELLS):
             return 100
@@ -143,6 +149,7 @@ class EvasionCalculator(Node):
         cost = self.map_data[row * self.map_width + col]
         return 100 if cost == -1 else cost
 
+    # Getting "continuous" cost value on a path
     def get_cell_costs_vectorized(self, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
         if self.map_data is None: return np.full(xs.shape, 100)
         
@@ -161,7 +168,7 @@ class EvasionCalculator(Node):
 
     def get_stuck_recovery_target(self, our_x: float, our_y: float, our_yaw: float, 
                                   enemy_x: float, enemy_y: float, current_cost: int):
-        self.get_logger().warn("[EVASION] Executing Evasive Stuck Recovery!")
+        self.get_logger().warn(f"[EVASION] Executing Evasive Stuck Recovery! - Cost Value: {current_cost}")
         
         # [OPTIMIZED]: Array caching pulls compute requirements to near-zero
         probe_x = our_x + 0.6 * self.stuck_probe_cos
@@ -173,6 +180,7 @@ class EvasionCalculator(Node):
         front_cost = self.get_cell_cost(front_probe_x, front_probe_y)
         facing_obstacle = (front_cost >= current_cost) or (front_cost >= MAX_SAFE_COST)
 
+        # Scoring math
         cost_drop = current_cost - probe_costs
         scores = cost_drop * 15.0
 
@@ -191,6 +199,7 @@ class EvasionCalculator(Node):
         else:
             scores -= turn_diff * 1.5
 
+        # If no vaild path, then just rotate
         valid_angles = probe_costs < MAX_EMERGENCY_COST
         if not np.any(valid_angles):
             escape_yaw = our_yaw + (math.pi / 2.0)
@@ -219,15 +228,19 @@ class EvasionCalculator(Node):
         
         start_dist_to_enemy = math.hypot(start_x - e_x, start_y - e_y)
 
+        # If the distance is very small
         if dist < 0.05: 
             return self.get_cell_cost(end_x, end_y) <= max_cost
 
+        # Dynamic step size method
         step_size = 0.10 if dist <= 0.8 else 0.05
         steps = max(2, int(dist / step_size))
 
+        # Cutting our path in steps
         dx = (end_x - start_x) / steps
         dy = (end_y - start_y) / steps
 
+        # Getting the cost pre step
         for i in range(1, steps + 1):
             px = start_x + dx * i
             py = start_y + dy * i
@@ -273,7 +286,8 @@ class EvasionCalculator(Node):
             w_dist, w_speed = 22.0, 4.0
             
         return {'w_dist': w_dist, 'w_speed': w_speed, 'w_turn': w_turn, 'w_cost': w_cost}
-
+    
+    # This method take the above method outcome as indication and take the best path
     def evaluate_and_select_best_escape(self, our_x, our_y, our_yaw, enemy_x, enemy_y, enemy_yaw):
         c_x = our_x + self.cand_dx
         c_y = our_y + self.cand_dy
@@ -361,6 +375,7 @@ class EvasionCalculator(Node):
         best_point = None
         best_score = -float('inf')
 
+        # Running the path, to find the best paths
         for rank, idx in enumerate(top_indices):
             tx, ty, t_angle, t_base_score = c_x[idx], c_y[idx], cand_angle[idx], scores[idx]
             
@@ -379,7 +394,8 @@ class EvasionCalculator(Node):
             dl = abs(math.atan2(math.sin(best_point[2] - tangent_left), math.cos(best_point[2] - tangent_left)))
             dr = abs(math.atan2(math.sin(best_point[2] - tangent_right), math.cos(best_point[2] - tangent_right)))
             self.slide_direction_bias = 'LEFT' if dl < dr else 'RIGHT'
-            
+
+        self.get_logger().warn(f"[EVASION STATE] A PATH FOUND! GOING TO {best_point}")
         return best_point, best_score
 
     def execute_emergency_escape(self, global_x: float, global_y: float, enemy_x: float, enemy_y: float, our_yaw: float):
@@ -447,6 +463,7 @@ class EvasionCalculator(Node):
                 return spin_x, spin_y, best_yaw
 
         # --- PHASE 3: Absolute Last Resort (Completely Trapped) ---
+        # TODO: IF COMPLETELY STUCK, then rotate to enemy to take a photo
         self.get_logger().error("[EVASION EMERGENCY] Phase 3: Completely trapped! Forcing blind 180-spin from enemy.")
         angle_to_enemy = math.atan2(enemy_y - global_y, enemy_x - global_x)
         escape_yaw = angle_to_enemy + math.pi # Spin 180 away from enemy
@@ -466,6 +483,7 @@ class EvasionCalculator(Node):
             self.slide_direction_bias, self.last_chosen_angle = None, None
             return
 
+        # Getting the TF
         try:
             tf_global = self.tf_buffer.lookup_transform(self.map_frame, self.robot_frame, rclpy.time.Time())
             tf_enemy_global = self.tf_buffer.lookup_transform(self.map_frame, self.enemy_frame, rclpy.time.Time())
@@ -499,6 +517,7 @@ class EvasionCalculator(Node):
         front_y = global_y + 0.25 * math.sin(our_yaw)
         front_cost = self.get_cell_cost(front_x, front_y)
 
+        # Checking if STUCK
         is_stuck = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
 
         if is_stuck:
@@ -514,10 +533,14 @@ class EvasionCalculator(Node):
             self.active_target_x = target_x
             self.active_target_y = target_y
         else:
+            # Get the best path: This point runs / 
+            # connects all the other function: get cost, get_path ....
             best_target, max_score = self.evaluate_and_select_best_escape(
                 global_x, global_y, our_yaw, enemy_global_x, enemy_global_y, enemy_global_yaw
             )
 
+
+            # RUNNING EMERGENCY ESCAPE if No path found
             is_emergency = False
             if best_target is None or max_score < -25.0:
                 if now - self.last_log_time > LOG_THROTTLE_SEC:
@@ -538,6 +561,7 @@ class EvasionCalculator(Node):
             
             self.last_target_x, self.last_target_y = target_x, target_y
 
+        # Sending the Data
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = self.map_frame

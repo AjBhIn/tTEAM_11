@@ -17,7 +17,9 @@ MAX_EMERGENCY_COST = 95
 STUCK_ESCAPE_DIST = 1.2         
 
 CAPTURE_ORIENT_DIST = 0.35      
-MIN_YAW_UPDATE_DIST = 0.15      
+MIN_YAW_UPDATE_DIST = 0.15
+DIST_STEPS = [0.2, 0.4, 0.6, 0.8]
+STUCK_DIST_STEPS = [1.2, 1.0, 0.8, 0.6]      
 
 CHASE_LEASH_DIST = 0.8          
 STRIKE_TARGET_DIST = 0.10       
@@ -34,6 +36,7 @@ class ChaserCalculator(Node):
     def __init__(self):
         super().__init__('chaser_calculator')
 
+        # Dynamic Namespace
         raw_ns = self.get_namespace().strip('/')
         default_robot_ns = raw_ns if raw_ns else 'our_bot'
 
@@ -151,6 +154,7 @@ class ChaserCalculator(Node):
         if self.costmap is None: return True
         return self.get_cell_cost(x, y) <= max_cost
 
+    # Recovery method when the bot is stuck in inflated zone.
     def get_chaser_stuck_recovery_target(self, our_x: float, our_y: float, our_yaw: float, 
                                          enemy_x: float, enemy_y: float, carrot_x: float, carrot_y: float, 
                                          current_cost: int, should_log: bool):
@@ -189,7 +193,7 @@ class ChaserCalculator(Node):
         best_escape_yaw = float(self.probe_angles[best_idx])
 
         escape_dist = 0.6 
-        for d in (1.2, 1.0, 0.8, 0.6):
+        for d in STUCK_DIST_STEPS:
             tx = our_x + d * math.cos(best_escape_yaw)
             ty = our_y + d * math.sin(best_escape_yaw)
             if self.get_cell_cost(tx, ty) < MAX_SAFE_COST and math.hypot(tx - enemy_x, ty - enemy_y) >= 0.45:
@@ -230,6 +234,7 @@ class ChaserCalculator(Node):
         if self.current_state == 'STRIKING':
             return target_x, target_y
 
+        # First runs the straight path creator
         trunc_x, trunc_y = self.truncate_to_line_of_sight(p_x, p_y, target_x, target_y)
         
         if math.hypot(trunc_x - target_x, trunc_y - target_y) < 0.05:
@@ -238,7 +243,8 @@ class ChaserCalculator(Node):
         best_tx, best_ty = trunc_x, trunc_y
         best_score = float('inf')
 
-        for r in [0.2, 0.4, 0.6, 0.8]:
+        
+        for r in DIST_STEPS:
             for angle in range(0, 360, 30):
                 rad = math.radians(angle)
                 tx = target_x + r * math.cos(rad)
@@ -312,6 +318,7 @@ class ChaserCalculator(Node):
         if self.filtered_target_x is None:
             self.filtered_target_x, self.filtered_target_y = c_x, c_y
         else:
+            # Alpha value works as smoother when steep angle chosen
             alpha = 0.4 if self.enemy_yaw_rate > MAX_YAW_RATE_SMOOTHING else 0.8  
             self.filtered_target_x = alpha * c_x + (1.0 - alpha) * self.filtered_target_x
             self.filtered_target_y = alpha * c_y + (1.0 - alpha) * self.filtered_target_y
@@ -322,6 +329,7 @@ class ChaserCalculator(Node):
 
         tactical_x, tactical_y = 0.0, 0.0
 
+        # This here is to avoid robot even when in chasing
         if abs_front_diff < math.radians(120.0):
             if not self.flank_active_logged:
                 self.get_logger().warn(f"[CHASER CALCULATOR] Orbiting {ORBITAL_FLANK_DIST}m around to the rear pocket!")
@@ -381,6 +389,7 @@ class ChaserCalculator(Node):
             rot_z = math.sin(self.last_valid_yaw / 2.0)
             rot_w = math.cos(self.last_valid_yaw / 2.0)
 
+        # Finding a normal to move to 
         safe_x, safe_y = self.find_arc_path_to_target(target_x, target_y, p_x, p_y, our_yaw)
 
         current_cost = self.get_cell_cost(p_x, p_y)
@@ -398,9 +407,11 @@ class ChaserCalculator(Node):
             if current_cost < 75 and front_cost < 75 and not target_collapsed:
                 self.is_recovering = False
 
+        # Checking if stuck
         is_stuck = self.is_recovering and (self.current_state == 'CHASING')
         should_log = (now_sec - self.last_log_time > LOG_THROTTLE_SEC)
 
+        # Run recovery
         if is_stuck:
             if should_log:
                 reason = f"High Elevation (Center: {current_cost}, Bumper: {front_cost})" if (current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST) else "Path Collapsed (Blocked)"
