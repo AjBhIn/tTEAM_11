@@ -169,9 +169,10 @@ class EvasionCalculator(Node):
         costs = np.where((costs == -1) | invalid, 100, costs)
         return costs
 
+
     def get_stuck_recovery_target(self, our_x: float, our_y: float, our_yaw: float, 
-                                  enemy_x: float, enemy_y: float, current_cost: int):
-        self.get_logger().warn(f"[EVASION] Executing Evasive Stuck Recovery! - Cost Value: {current_cost}")
+                                  enemy_x: float, enemy_y: float, enemy_yaw: float, current_cost: int):
+        self.get_logger().warn(f"[EVASION RECOVERY] Executing Smart Evasive Recovery! Cost: {current_cost}")
         
         # [OPTIMIZED]: Array caching pulls compute requirements to near-zero
         probe_x = our_x + 0.6 * self.stuck_probe_cos
@@ -183,34 +184,48 @@ class EvasionCalculator(Node):
         front_cost = self.get_cell_cost(front_probe_x, front_probe_y)
         facing_obstacle = (front_cost >= current_cost) or (front_cost >= MAX_SAFE_COST)
 
-        # Scoring math
+        # 1. Gradient Dominance (Get off the wall!)
         cost_drop = current_cost - probe_costs
         scores = cost_drop * 15.0
 
+        # 2. Maximize Distance from Enemy (Bumped from 2.0 to 5.0 for harder push-off)
         dist_to_enemy = np.hypot(probe_x - enemy_x, probe_y - enemy_y)
-        scores += dist_to_enemy * 2.0
+        scores += dist_to_enemy * 5.0 
 
-        turn_diff = np.abs(np.arctan2(np.sin(self.stuck_probe_angles - our_yaw), np.cos(self.stuck_probe_angles - our_yaw)))
-        
+        # 3. Aggressive Anti-Ramming Cone (Matched Chaser's 75-degree success)
         angle_to_enemy = np.arctan2(enemy_y - our_y, enemy_x - our_x)
-        enemy_diff = np.abs(np.arctan2(np.sin(self.stuck_probe_angles - angle_to_enemy), np.cos(self.stuck_probe_angles - angle_to_enemy)))
-        
-        scores = np.where(enemy_diff < np.deg2rad(45.0), scores - 500.0, scores)
+        enemy_diff = np.abs((self.stuck_probe_angles - angle_to_enemy + np.pi) % (2 * np.pi) - np.pi)
+        scores = np.where(enemy_diff < 1.309, scores - 500.0, scores) # 1.309 rad = 75 degrees
 
+        # 4. Smooth Turning vs Panic Spinning
+        turn_diff = np.abs((self.stuck_probe_angles - our_yaw + np.pi) % (2 * np.pi) - np.pi)
         if facing_obstacle:
-            scores = np.where(turn_diff < np.deg2rad(60.0), scores - 500.0, scores)
+            # If facing a wall, we MUST turn. Allow up to 120 degrees of rotation before penalizing.
+            scores = np.where(turn_diff < 2.094, scores, scores - 500.0) 
         else:
-            scores -= turn_diff * 1.5
+            # If not facing a wall directly, favor smoother paths
+            scores -= turn_diff * 1.5 
 
-        # If no vaild path, then just rotate
+        # 5. Opportunistic Rear-Pocket Attraction
+        angle_from_enemy_to_probe = np.arctan2(probe_y - enemy_y, probe_x - enemy_x)
+        probe_rel_to_enemy_front = np.abs((angle_from_enemy_to_probe - enemy_yaw + np.pi) % (2 * np.pi) - np.pi)
+        is_rear_pocket = probe_rel_to_enemy_front >= 2.094 # 120 degrees
+        scores += np.where(is_rear_pocket, 150.0, 0.0)
+
         valid_angles = probe_costs < MAX_EMERGENCY_COST
+        
         if not np.any(valid_angles):
-            escape_yaw = our_yaw + (math.pi / 2.0)
-            return our_x, our_y, escape_yaw
+            # [UPGRADE]: Chaser's Cross-Product Escape. Spins away from the enemy dynamically.
+            self.get_logger().warn("[EVASION RECOVERY] Boxed in! Executing Cross-Product lateral spin.")
+            cross_product = math.cos(our_yaw) * math.sin(angle_to_enemy) - math.sin(our_yaw) * math.cos(angle_to_enemy)
+            spin_dir = -1.0 if cross_product > 0 else 1.0
+            best_escape_yaw = our_yaw + (spin_dir * math.pi / 2.0)
+            return our_x, our_y, best_escape_yaw
 
         best_idx = np.argmax(np.where(valid_angles, scores, -1e9))
         best_escape_yaw = float(self.stuck_probe_angles[best_idx])
 
+        # Project goal outward into safe space
         escape_dist = STUCK_ESCAPE_DIST
         for d in (1.2, 1.0, 0.8, 0.6):
             tx = our_x + d * math.cos(best_escape_yaw)
@@ -221,6 +236,9 @@ class EvasionCalculator(Node):
 
         rec_x = our_x + escape_dist * math.cos(best_escape_yaw)
         rec_y = our_y + escape_dist * math.sin(best_escape_yaw)
+
+        if is_rear_pocket[best_idx]:
+            self.get_logger().info(f"[EVASION RECOVERY] Opportunistic Rear Pocket Detected! Escaping toward enemy's blind spot.")
 
         return rec_x, rec_y, best_escape_yaw
 
@@ -548,8 +566,9 @@ class EvasionCalculator(Node):
                 self.get_logger().warn(f"[EVASION TRIGGER] Stuck detected (C:{current_cost} F:{front_cost}). Executing Recovery.")
                 self.last_log_time = now
 
+            # [UPDATED]: Passed enemy_global_yaw so recovery knows where the enemy's rear pocket is
             target_x, target_y, target_yaw = self.get_stuck_recovery_target(
-                global_x, global_y, our_yaw, enemy_global_x, enemy_global_y, current_cost
+                global_x, global_y, our_yaw, enemy_global_x, enemy_global_y, enemy_global_yaw, current_cost
             )
             self.last_target_x = target_x
             self.last_target_y = target_y
