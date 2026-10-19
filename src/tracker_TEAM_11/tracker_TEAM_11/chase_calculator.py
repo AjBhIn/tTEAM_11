@@ -98,6 +98,7 @@ class ChaserCalculator(Node):
         self.flank_lock_time = 0.0
         
         self.is_recovering = False
+        self.high_cost_start_time = None
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -417,30 +418,51 @@ class ChaserCalculator(Node):
         # Finding a normal to move to 
         safe_x, safe_y = self.find_arc_path_to_target(target_x, target_y, p_x, p_y, our_yaw)
 
+
+        # --- DWB-AWARE STUCK DETECTION ---
+        # MAGICAL NUMBERS PRESENT HERE 
         current_cost = self.get_cell_cost(p_x, p_y)
-        front_x = p_x + 0.25 * math.cos(our_yaw)
-        front_y = p_y + 0.25 * math.sin(our_yaw)
+        
+        # [OPTIMIZED]: Retracted bumper projection to 0.15m to allow DWB to corner-cut smoothly
+        front_x = p_x + 0.15 * math.cos(our_yaw)
+        front_y = p_y + 0.15 * math.sin(our_yaw)
         front_cost = self.get_cell_cost(front_x, front_y)
 
-        dist_to_safe = math.hypot(safe_x - p_x, safe_y - p_y)
-        target_collapsed = (dist_to_safe < 0.25) and (dist_to_enemy > 0.60)
+        dist_to_safe_sq = (safe_x - p_x)**2 + (safe_y - p_y)**2
+        dist_to_enemy_sq = (e_x - p_x)**2 + (e_y - p_y)**2
         
+        target_collapsed = (dist_to_safe_sq < 0.0625) and (dist_to_enemy_sq > 0.36)
+        
+        # 1. Check if we are in lethal space or just corner-cutting
+        is_lethal = (current_cost >= 98) or (front_cost >= 98)
+        in_high_cost = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
+
+        # 2. Update the Corner-Cutting Timer
+        if in_high_cost:
+            if self.high_cost_start_time is None:
+                self.high_cost_start_time = now_sec
+        else:
+            self.high_cost_start_time = None
+
+        time_in_high_cost = (now_sec - self.high_cost_start_time) if self.high_cost_start_time else 0.0
+
+        # 3. Trigger Logic
         if not self.is_recovering:
-            if current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST or target_collapsed:
+            # Trigger instantly on Lethal/Collapsed, OR wait 0.4s for DWB to clear the corner
+            if is_lethal or target_collapsed or time_in_high_cost > 0.40:
                 self.is_recovering = True
         else:
+            # Release recovery once we are in completely clear space
             if current_cost < 75 and front_cost < 75 and not target_collapsed:
                 self.is_recovering = False
+                self.high_cost_start_time = None
 
-        # Checking if stuck
-        # TODO: Might need to add a buffer here so it does not immeditely get trigged
         is_stuck = self.is_recovering and (self.current_state == 'CHASING')
         should_log = (now_sec - self.last_log_time > LOG_THROTTLE_SEC)
 
-        # Run recovery
         if is_stuck:
             if should_log:
-                reason = f"High Elevation (Center: {current_cost}, Bumper: {front_cost})" if (current_cost >= MAX_SAFE_COST or front_cost >= MAX_SAFE_COST) else "Path Collapsed (Blocked)"
+                reason = "Lethal Crash" if is_lethal else ("Timeout in High Cost" if in_high_cost else "Path Collapsed")
                 self.get_logger().warn(f"[CHASER TRIGGER] Stuck detected via {reason}. Firing Recovery!")
                 
             safe_x, safe_y, safe_yaw = self.get_chaser_stuck_recovery_target(

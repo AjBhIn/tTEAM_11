@@ -115,6 +115,9 @@ class EvasionCalculator(Node):
         self.last_log_time = 0.0
         self.last_tf_time = 0.0 
 
+        self.is_recovering = False       # NEW: Hysteresis lock to prevent recovery stutter
+        self.high_cost_start_time = None # NEW: DWB Corner-cutting timer
+
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
         self.get_logger().info("[EVASION CALCULATOR] Initialized. Zero-Allocation Math Arrays Active.")
 
@@ -551,22 +554,46 @@ class EvasionCalculator(Node):
         enemy_global_y = tf_enemy_global.transform.translation.y
         enemy_global_yaw = self.get_yaw_from_quaternion(tf_enemy_global.transform.rotation)
 
+        # --- DWB-AWARE STUCK DETECTION ---
         current_cost = self.get_cell_cost(global_x, global_y)
         
-        front_x = global_x + 0.25 * math.cos(our_yaw)
-        front_y = global_y + 0.25 * math.sin(our_yaw)
+        # Retracted projection to 0.15m
+        front_x = global_x + 0.15 * math.cos(our_yaw)
+        front_y = global_y + 0.15 * math.sin(our_yaw)
         front_cost = self.get_cell_cost(front_x, front_y)
 
-        # Checking if STUCK
-        # TODO: Might need to add a buffer here so it does not immeditely get trigged
-        is_stuck = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
+        # 1. Check if we are in lethal space or just corner-cutting
+        is_lethal = (current_cost >= 98) or (front_cost >= 98)
+        in_high_cost = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
+
+        # 2. Update the Corner-Cutting Timer
+        if in_high_cost:
+            if self.high_cost_start_time is None:
+                self.high_cost_start_time = now
+        else:
+            self.high_cost_start_time = None
+
+        time_in_high_cost = (now - self.high_cost_start_time) if self.high_cost_start_time else 0.0
+
+        # 3. Trigger Logic with Hysteresis Lock
+        if not self.is_recovering:
+            # Trigger instantly on Lethal crash, OR wait 0.4s for DWB to clear the corner
+            if is_lethal or time_in_high_cost > 0.40:
+                self.is_recovering = True
+        else:
+            # Release recovery once we are in completely clear space
+            if current_cost < 75 and front_cost < 75:
+                self.is_recovering = False
+                self.high_cost_start_time = None
+
+        is_stuck = self.is_recovering
 
         if is_stuck:
             if now - self.last_log_time > LOG_THROTTLE_SEC:
-                self.get_logger().warn(f"[EVASION TRIGGER] Stuck detected (C:{current_cost} F:{front_cost}). Executing Recovery.")
+                reason = "Lethal Crash" if is_lethal else "Timeout in High Cost"
+                self.get_logger().warn(f"[EVASION TRIGGER] Stuck detected via {reason} (C:{current_cost} F:{front_cost}). Executing Recovery.")
                 self.last_log_time = now
 
-            # [UPDATED]: Passed enemy_global_yaw so recovery knows where the enemy's rear pocket is
             target_x, target_y, target_yaw = self.get_stuck_recovery_target(
                 global_x, global_y, our_yaw, enemy_global_x, enemy_global_y, enemy_global_yaw, current_cost
             )
