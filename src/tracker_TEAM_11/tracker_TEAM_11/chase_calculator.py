@@ -82,6 +82,14 @@ class ChaserCalculator(Node):
         self.filtered_target_x = None
         self.filtered_target_y = None
 
+        # [OPTIMIZED]: Pre-computed target-centric arc offsets for fast pathing around obstacles
+        arc_radii = np.array([0.2, 0.4, 0.6, 0.8])
+        arc_angles = np.deg2rad(np.arange(0, 360, 30))
+        r_grid, a_grid = np.meshgrid(arc_radii, arc_angles)
+        self.arc_dx = (r_grid * np.cos(a_grid)).flatten()
+        self.arc_dy = (r_grid * np.sin(a_grid)).flatten()
+        self.arc_r = r_grid.flatten() # Pre-cached distance from candidate to true target
+
         self.flank_active_logged = False
         self.dive_active_logged = False
         self.was_sleeping = False  
@@ -236,39 +244,49 @@ class ChaserCalculator(Node):
         if self.current_state == 'STRIKING':
             return target_x, target_y
 
-        # First runs the straight path creator
+        # 1. Try the direct straight-line path first
         trunc_x, trunc_y = self.truncate_to_line_of_sight(p_x, p_y, target_x, target_y)
-        
-        if math.hypot(trunc_x - target_x, trunc_y - target_y) < 0.05:
+        if ((trunc_x - target_x)**2 + (trunc_y - target_y)**2) < 0.0025:
             return target_x, target_y
 
-        best_tx, best_ty = trunc_x, trunc_y
-        best_score = float('inf')
+        # 2. Direct path blocked. Use vectorized candidate generation around the target.
+        txs = target_x + self.arc_dx
+        tys = target_y + self.arc_dy
 
+        # 3. Calculate angles from robot to all candidates simultaneously
+        angles_from_robot = np.arctan2(tys - p_y, txs - p_x)
         
-        for r in DIST_STEPS:
-            for angle in range(0, 360, 30):
-                rad = math.radians(angle)
-                tx = target_x + r * math.cos(rad)
-                ty = target_y + r * math.sin(rad)
+        # 4. Prune backward-facing paths instantly (must stay offensive)
+        turn_diffs = np.abs((angles_from_robot - our_yaw + np.pi) % (2 * np.pi) - np.pi)
+        valid_mask = turn_diffs <= 1.745 # 100 degrees
+        
+        if not np.any(valid_mask):
+            return trunc_x, trunc_y # Fallback to truncated straight line if all arcs are behind us
+            
+        v_txs = txs[valid_mask]
+        v_tys = tys[valid_mask]
+        v_r = self.arc_r[valid_mask]
+
+        # 5. Score valid candidates using fast NumPy arrays
+        dist_to_robot = np.hypot(v_txs - p_x, v_tys - p_y)
+        scores = v_r + (dist_to_robot * 0.2)
+        
+        # Sort indices by best score (lowest is best)
+        sorted_indices = np.argsort(scores)
+        
+        # 6. Raycast only the best paths. Stop immediately once a clear path is found!
+        for idx in sorted_indices:
+            cand_x = float(v_txs[idx])
+            cand_y = float(v_tys[idx])
+            
+            arc_trunc_x, arc_trunc_y = self.truncate_to_line_of_sight(p_x, p_y, cand_x, cand_y)
+            
+            # If the raycast reaches the candidate point without hitting a wall, take it and exit!
+            if ((arc_trunc_x - cand_x)**2 + (arc_trunc_y - cand_y)**2) < 0.0025:
+                return cand_x, cand_y
                 
-                angle_from_robot = math.atan2(ty - p_y, tx - p_x)
-                turn_diff = abs(math.atan2(math.sin(angle_from_robot - our_yaw), math.cos(angle_from_robot - our_yaw)))
-                
-                if turn_diff > math.radians(100.0):
-                    continue
-                
-                arc_trunc_x, arc_trunc_y = self.truncate_to_line_of_sight(p_x, p_y, tx, ty)
-                if math.hypot(arc_trunc_x - tx, arc_trunc_y - ty) < 0.05:
-                    d_to_target = math.hypot(tx - target_x, ty - target_y)
-                    d_to_robot = math.hypot(tx - p_x, ty - p_y)
-                    score = d_to_target + (d_to_robot * 0.2)
-                    
-                    if score < best_score:
-                        best_score = score
-                        best_tx, best_ty = tx, ty
-                        
-        return best_tx, best_ty
+        # If all arcs are physically blocked by the costmap, return the safest straight-line truncation
+        return trunc_x, trunc_y
 
     def update_enemy_yaw_rate(self, enemy_yaw: float, current_time: float):
         if self.last_enemy_yaw is not None and self.last_enemy_time is not None:
