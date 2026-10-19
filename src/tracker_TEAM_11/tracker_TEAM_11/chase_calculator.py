@@ -83,7 +83,7 @@ class ChaserCalculator(Node):
         self.filtered_target_y = None
 
         # [OPTIMIZED]: Pre-computed target-centric arc offsets for fast pathing around obstacles
-        arc_radii = np.array([0.2, 0.4, 0.6, 0.8])
+        arc_radii = np.array(DIST_STEPS)
         arc_angles = np.deg2rad(np.arange(0, 360, 30))
         r_grid, a_grid = np.meshgrid(arc_radii, arc_angles)
         self.arc_dx = (r_grid * np.cos(a_grid)).flatten()
