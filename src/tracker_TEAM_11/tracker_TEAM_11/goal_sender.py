@@ -119,10 +119,10 @@ class GoalSender(Node):
             self.force_update = True 
             self.state = new_state
             
-            # [OPTIMIZED]: Actively cancel the current Nav2 goal so the robot snaps instantly to the new state
-            if self.active_goal_handle:
-                self.active_goal_handle.cancel_goal_async()
-                self.active_goal_handle = None
+            # # [OPTIMIZED]: Actively cancel the current Nav2 goal so the robot snaps instantly to the new state
+            # if self.active_goal_handle:
+            #     self.active_goal_handle.cancel_goal_async()
+            #     self.active_goal_handle = None
 
     def get_yaw_from_quaternion(self, q):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
