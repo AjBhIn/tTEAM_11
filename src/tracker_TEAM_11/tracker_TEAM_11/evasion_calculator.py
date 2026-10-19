@@ -555,6 +555,7 @@ class EvasionCalculator(Node):
         enemy_global_yaw = self.get_yaw_from_quaternion(tf_enemy_global.transform.rotation)
 
         # --- DWB-AWARE STUCK DETECTION ---
+        # Getting the info for reocvery method, to check if stuck or not
         current_cost = self.get_cell_cost(global_x, global_y)
         
         # Retracted projection to 0.15m
@@ -563,7 +564,7 @@ class EvasionCalculator(Node):
         front_cost = self.get_cell_cost(front_x, front_y)
 
         # 1. Check if we are in lethal space or just corner-cutting
-        is_lethal = (current_cost >= 98) or (front_cost >= 98)
+        is_lethal = (current_cost >= MAX_EMERGENCY_COST) or (front_cost >= MAX_EMERGENCY_COST)
         in_high_cost = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
 
         # 2. Update the Corner-Cutting Timer
@@ -582,12 +583,13 @@ class EvasionCalculator(Node):
                 self.is_recovering = True
         else:
             # Release recovery once we are in completely clear space
-            if current_cost < 75 and front_cost < 75:
+            if current_cost < MAX_SAFE_COST and front_cost < MAX_SAFE_COST:
                 self.is_recovering = False
                 self.high_cost_start_time = None
 
         is_stuck = self.is_recovering
 
+        # Running Stuck Recovery method
         if is_stuck:
             if now - self.last_log_time > LOG_THROTTLE_SEC:
                 reason = "Lethal Crash" if is_lethal else "Timeout in High Cost"

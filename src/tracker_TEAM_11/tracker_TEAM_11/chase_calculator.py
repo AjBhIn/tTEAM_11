@@ -434,7 +434,7 @@ class ChaserCalculator(Node):
         target_collapsed = (dist_to_safe_sq < 0.0625) and (dist_to_enemy_sq > 0.36)
         
         # 1. Check if we are in lethal space or just corner-cutting
-        is_lethal = (current_cost >= 98) or (front_cost >= 98)
+        is_lethal = (current_cost >= MAX_EMERGENCY_COST) or (front_cost >= MAX_EMERGENCY_COST)
         in_high_cost = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
 
         # 2. Update the Corner-Cutting Timer
@@ -453,7 +453,7 @@ class ChaserCalculator(Node):
                 self.is_recovering = True
         else:
             # Release recovery once we are in completely clear space
-            if current_cost < 75 and front_cost < 75 and not target_collapsed:
+            if current_cost < (MAX_SAFE_COST - 10) and front_cost < (MAX_SAFE_COST - 10) and not target_collapsed:
                 self.is_recovering = False
                 self.high_cost_start_time = None
 
