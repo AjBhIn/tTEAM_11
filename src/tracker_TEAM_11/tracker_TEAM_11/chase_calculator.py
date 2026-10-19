@@ -86,6 +86,8 @@ class ChaserCalculator(Node):
         self.dive_active_logged = False
         self.was_sleeping = False  
         self.last_log_time = 0.0
+        self.flank_direction_bias = 1.0
+        self.flank_lock_time = 0.0
         
         self.is_recovering = False
 
@@ -330,14 +332,19 @@ class ChaserCalculator(Node):
         tactical_x, tactical_y = 0.0, 0.0
 
         # This here is to avoid robot even when in chasing
-        if abs_front_diff < math.radians(120.0):
+        if abs_front_diff < 2.094:
             if not self.flank_active_logged:
                 self.get_logger().warn(f"[CHASER CALCULATOR] Orbiting {ORBITAL_FLANK_DIST}m around to the rear pocket!")
                 self.flank_active_logged = True
             self.dive_active_logged = False
             
-            direction_sign = 1.0 if rel_angle_from_front >= 0.0 else -1.0
-            orbit_angle = angle_to_pursuer_from_enemy + (direction_sign * math.radians(60.0))
+            # --- FLANK COMMITMENT LOCK ---
+            # Prevent the target from teleporting left/right if the enemy wiggles near 0.0 rad
+            if (now_sec - self.flank_lock_time) > 1.0:
+                self.flank_direction_bias = 1.0 if rel_angle_from_front >= 0.0 else -1.0
+                self.flank_lock_time = now_sec
+                
+            orbit_angle = angle_to_pursuer_from_enemy + (self.flank_direction_bias * 1.047)
             
             tactical_x = e_x + ORBITAL_FLANK_DIST * math.cos(orbit_angle)
             tactical_y = e_y + ORBITAL_FLANK_DIST * math.sin(orbit_angle)
@@ -408,6 +415,7 @@ class ChaserCalculator(Node):
                 self.is_recovering = False
 
         # Checking if stuck
+        # TODO: Might need to add a buffer here so it does not immeditely get trigged
         is_stuck = self.is_recovering and (self.current_state == 'CHASING')
         should_log = (now_sec - self.last_log_time > LOG_THROTTLE_SEC)
 

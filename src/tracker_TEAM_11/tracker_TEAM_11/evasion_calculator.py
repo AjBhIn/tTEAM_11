@@ -100,6 +100,7 @@ class EvasionCalculator(Node):
         self.em_cand_dy = (em_r_grid * np.sin(em_a_grid)).flatten()
 
         self.map_data = None
+        self.inv_res = 20.0
         self.map_res = 0.05
         self.map_width = self.map_height = 0
         self.map_origin_x = self.map_origin_y = 0.0 
@@ -108,7 +109,8 @@ class EvasionCalculator(Node):
         self.active_target_x, self.active_target_y = None, None
         
         self.slide_direction_bias = None 
-        self.last_chosen_angle = None 
+        self.last_chosen_angle = None
+        self.slide_lock_time = 0.0
 
         self.last_log_time = 0.0
         self.last_tf_time = 0.0 
@@ -129,17 +131,18 @@ class EvasionCalculator(Node):
     def costmap_callback(self, msg: OccupancyGrid):
         self.map_data = np.array(msg.data, dtype=np.int16)
         self.map_res = msg.info.resolution
+        self.inv_res = 1.0 / self.map_res if self.map_res > 0 else 20.0
         self.map_width, self.map_height = msg.info.width, msg.info.height
         self.map_origin_x, self.map_origin_y = msg.info.origin.position.x, msg.info.origin.position.y
-
+        
     # Getting cost value of one px a time
     def get_cell_cost(self, x: float, y: float) -> int:
         if self.map_data is None: return 100
-        raw_col = int((x - self.map_origin_x) / self.map_res)
-        raw_row = int((y - self.map_origin_y) / self.map_res)
+        
+        # [OPTIMIZED]: Multiplication replaces heavy division
+        raw_col = int((x - self.map_origin_x) * self.inv_res)
+        raw_row = int((y - self.map_origin_y) * self.inv_res)
 
-        # Adding a margin so the "goal placer" does place goal
-        # outside the map or on the boundaries of the map
         if raw_col < COSTMAP_MARGIN_CELLS or raw_col >= (self.map_width - COSTMAP_MARGIN_CELLS) or \
            raw_row < COSTMAP_MARGIN_CELLS or raw_row >= (self.map_height - COSTMAP_MARGIN_CELLS):
             return 100
@@ -308,8 +311,19 @@ class EvasionCalculator(Node):
 
         weights = self.get_adaptive_weights(current_cost, math.hypot(our_x - enemy_x, our_y - enemy_y))
         dist_to_enemy = np.hypot(c_x - enemy_x, c_y - enemy_y)
+
+        # --- PREDICTIVE GHOST PROJECTION ---
+        # Project a "ghost" enemy 0.6m forward along its current heading
+        ghost_x = enemy_x + 0.6 * math.cos(enemy_yaw)
+        ghost_y = enemy_y + 0.6 * math.sin(enemy_yaw)
         
+        # Calculate distance from our escape candidates to the enemy's future position
+        dist_to_ghost = np.hypot(c_x - ghost_x, c_y - ghost_y)
+        
+        # Severely penalize paths that cross in front of the moving enemy
         scores = (dist_to_enemy * weights['w_dist']) + (c_r * weights['w_speed'])
+        scores += np.where(dist_to_ghost < 0.6, scores - 40.0, scores)
+        
 
         away_dx = our_x - enemy_x
         away_dy = our_y - enemy_y
@@ -391,9 +405,17 @@ class EvasionCalculator(Node):
         if best_point is not None:
             self.active_target_x, self.active_target_y = best_point[0], best_point[1]
             self.last_chosen_angle = best_point[2]
-            dl = abs(math.atan2(math.sin(best_point[2] - tangent_left), math.cos(best_point[2] - tangent_left)))
-            dr = abs(math.atan2(math.sin(best_point[2] - tangent_right), math.cos(best_point[2] - tangent_right)))
-            self.slide_direction_bias = 'LEFT' if dl < dr else 'RIGHT'
+
+            # Avoid flucation
+            # --- SLIDE COMMITMENT LOCK ---
+            now_sec = self.get_clock().now().nanoseconds / 1e9
+            
+            # Only allow the slide direction to flip if 1.0 second has passed
+            if (now_sec - self.slide_lock_time) > 1.0:
+                dl = abs((best_point[2] - tangent_left + math.pi) % (2 * math.pi) - math.pi)
+                dr = abs((best_point[2] - tangent_right + math.pi) % (2 * math.pi) - math.pi)
+                self.slide_direction_bias = 'LEFT' if dl < dr else 'RIGHT'
+                self.slide_lock_time = now_sec
 
         self.get_logger().warn(f"[EVASION STATE] A PATH FOUND! GOING TO {best_point}")
         return best_point, best_score
@@ -518,6 +540,7 @@ class EvasionCalculator(Node):
         front_cost = self.get_cell_cost(front_x, front_y)
 
         # Checking if STUCK
+        # TODO: Might need to add a buffer here so it does not immeditely get trigged
         is_stuck = (current_cost >= MAX_SAFE_COST) or (front_cost >= MAX_SAFE_COST)
 
         if is_stuck:
