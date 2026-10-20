@@ -14,7 +14,7 @@ BASE_DANGER_THRESHOLD_REAR = 0.25
 
 # --- EVASION LOCK VARIABLES ---
 # [OPTIMIZED]: Swapped degrees for native radians, bypassing math.radians() in execution
-REPOSITION_CLEAR_DIST = 2.0        
+REPOSITION_CLEAR_DIST = 1.2        
 REPOSITION_CLEAR_ANGLE_RAD = math.radians(120.0)
 
 FAST_APPROACH_SPEED = 0.2

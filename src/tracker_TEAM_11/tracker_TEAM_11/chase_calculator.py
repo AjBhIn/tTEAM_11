@@ -299,6 +299,10 @@ class ChaserCalculator(Node):
         self.last_enemy_time = current_time
 
     def control_loop(self):
+        # Do not calculate or trigger recovery panics until the global costmap actually arrives over the network.
+        if self.map_data is None:
+            return
+
         offensive_states = ['CHASING', 'STRIKING', 'COOLDOWN']
         now_sec = self.get_clock().now().nanoseconds / 1e9
         
@@ -408,9 +412,14 @@ class ChaserCalculator(Node):
         if math.hypot(dx, dy) > MIN_YAW_UPDATE_DIST:
             self.last_valid_yaw = math.atan2(dy, dx)
 
-        if dist_to_enemy <= CAPTURE_ORIENT_DIST:
-            rot_z = c_rot.z
-            rot_w = c_rot.w
+        # --- CAMERA LOCK-ON (YAW OVERRIDE) ---
+        dist_to_enemy_sq = (e_x - p_x)**2 + (e_y - p_y)**2
+
+        # If actively STRIKING or physically inside the capture radius, lock dead-center on the enemy
+        if self.current_state == 'STRIKING' or dist_to_enemy_sq <= (CAPTURE_ORIENT_DIST ** 2):
+            lock_on_yaw = math.atan2(e_y - p_y, e_x - p_x)
+            rot_z = math.sin(lock_on_yaw / 2.0)
+            rot_w = math.cos(lock_on_yaw / 2.0)
         else:
             rot_z = math.sin(self.last_valid_yaw / 2.0)
             rot_w = math.cos(self.last_valid_yaw / 2.0)
