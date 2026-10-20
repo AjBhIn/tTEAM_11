@@ -8,6 +8,9 @@ import tf2_ros
 from geometry_msgs.msg import TransformStamped
 import numpy as np
 
+# --- REQUIRED FOR QOS (QUALITY OF SERVICE) SPLIT ---
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+
 # --- GLOBAL TUNING VARIABLES ---
 LOOP_RATE_SEC = 0.033
 
@@ -16,13 +19,17 @@ MAX_SAFE_COST = 85
 MAX_EMERGENCY_COST = 95         
 STUCK_ESCAPE_DIST = 1.2         
 
-CAPTURE_ORIENT_DIST = 0.35      
+
+# ==============================================================
+# MIGHT NEED TO CHANGE
+# ==============================================================
+CAPTURE_ORIENT_DIST = 0.65      
 MIN_YAW_UPDATE_DIST = 0.15
 DIST_STEPS = [0.2, 0.4, 0.6, 0.8]
 STUCK_DIST_STEPS = [1.2, 1.0, 0.8, 0.6]      
 
-CHASE_LEASH_DIST = 0.8          
-STRIKE_TARGET_DIST = 0.10       
+CHASE_LEASH_DIST = 0.8
+STRIKE_TARGET_DIST = 0.10                
 ORBITAL_FLANK_DIST = 1.2        
 
 MAX_YAW_RATE_SMOOTHING = 1.0    
@@ -107,8 +114,18 @@ class ChaserCalculator(Node):
         state_topic = f'/{self.robot_ns}/robot_state' if self.robot_ns else '/robot_state'
         costmap_topic = f'/{self.robot_ns}/global_costmap/costmap' if self.robot_ns else '/global_costmap/costmap'
 
+        # Default string subscriber handles standard RELIABLE transitions
         self.create_subscription(String, state_topic, self.state_cb, 10)
-        self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_cb, 10)
+        
+        # --- QOS BOOT DELAY FIX ---
+        # Matches Nav2's latched settings to fetch the global map instantly on boot,
+        # completely bypassing the 1-minute paralysis.
+        costmap_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE
+        )
+        self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_cb, costmap_qos)
 
         self.timer = self.create_timer(LOOP_RATE_SEC, self.control_loop)
         self.get_logger().info("[CHASER CALCULATOR] Initialized. Zero-Allocation Math Arrays Active.")
@@ -299,7 +316,9 @@ class ChaserCalculator(Node):
         self.last_enemy_time = current_time
 
     def control_loop(self):
-        # Do not calculate or trigger recovery panics until the global costmap actually arrives over the network.
+        # --- PHANTOM WALL FIX ---
+        # Do not calculate or trigger recovery panics until the global costmap actually arrives.
+        # This prevents the robot from assuming it's embedded in a wall on startup.
         if self.map_data is None:
             return
 
@@ -316,6 +335,7 @@ class ChaserCalculator(Node):
             self.flank_active_logged = False
             self.dive_active_logged = False
             self.is_recovering = False
+            self.high_cost_start_time = None
             return
 
         if self.was_sleeping:
@@ -327,6 +347,11 @@ class ChaserCalculator(Node):
             t_carrot = self.tf_buffer.lookup_transform(self.map_frame, self.carrot_frame, rclpy.time.Time())
             t_enemy = self.tf_buffer.lookup_transform(self.map_frame, self.enemy_frame, rclpy.time.Time())
         except tf2_ros.TransformException as ex:
+            # --- SILENT LOCKOUT FIX ---
+            # Exposes when the physical camera is taking 45+ seconds to boot and provide enemy coordinates.
+            if now_sec - self.last_log_time > LOG_THROTTLE_SEC:
+                self.get_logger().warn(f"[CHASER] Paralyzed! Waiting for Tracker TFs: {ex}")
+                self.last_log_time = now_sec
             return
 
         p_x, p_y = t_our.transform.translation.x, t_our.transform.translation.y
@@ -377,9 +402,10 @@ class ChaserCalculator(Node):
             
             if self.current_state == 'STRIKING':
                 if not self.dive_active_logged:
-                    self.get_logger().info(f"[CHASER CALCULATOR] STRIKING! Precision deep target set to {STRIKE_TARGET_DIST}m.")
+                    self.get_logger().info(f"[CHASER CALCULATOR] STRIKING! Locking onto stable Carrot TF to punch through the target.")
                     self.dive_active_logged = True
                 
+                # --- NAV2 TOLERANCE FIX ---
                 approach_angle = math.atan2(e_y - p_y, e_x - p_x)
                 tactical_x = e_x - (STRIKE_TARGET_DIST * math.cos(approach_angle))
                 tactical_y = e_y - (STRIKE_TARGET_DIST * math.sin(approach_angle))
@@ -413,9 +439,10 @@ class ChaserCalculator(Node):
             self.last_valid_yaw = math.atan2(dy, dx)
 
         # --- CAMERA LOCK-ON (YAW OVERRIDE) ---
+        # Ensures that during a strike, the camera physically turns to lock onto the 
+        # enemy's center of mass rather than blindly copying their rotation vector.
         dist_to_enemy_sq = (e_x - p_x)**2 + (e_y - p_y)**2
 
-        # If actively STRIKING or physically inside the capture radius, lock dead-center on the enemy
         if self.current_state == 'STRIKING' or dist_to_enemy_sq <= (CAPTURE_ORIENT_DIST ** 2):
             lock_on_yaw = math.atan2(e_y - p_y, e_x - p_x)
             rot_z = math.sin(lock_on_yaw / 2.0)
@@ -438,9 +465,10 @@ class ChaserCalculator(Node):
         front_cost = self.get_cell_cost(front_x, front_y)
 
         dist_to_safe_sq = (safe_x - p_x)**2 + (safe_y - p_y)**2
-        dist_to_enemy_sq = (e_x - p_x)**2 + (e_y - p_y)**2
         
-        target_collapsed = (dist_to_safe_sq < 0.0625) and (dist_to_enemy_sq > 0.36)
+        # Expanded from 0.36 (0.60m) to 0.49 (0.70m). 
+        # Prevents false 'Stuck Recovery' panics when legitimately parked to take a photo.
+        target_collapsed = (dist_to_safe_sq < 0.0625) and (dist_to_enemy_sq > 0.49)
         
         # 1. Check if we are in lethal space or just corner-cutting
         is_lethal = (current_cost >= MAX_EMERGENCY_COST) or (front_cost >= MAX_EMERGENCY_COST)

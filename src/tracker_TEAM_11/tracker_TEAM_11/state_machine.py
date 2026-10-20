@@ -2,7 +2,7 @@
 import math
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 import tf2_ros
 
 # --- GLOBAL TUNING VARIABLES ---
@@ -25,7 +25,7 @@ STRIKE_ZONE_DIST = 1.2
 STRIKE_ZONE_ANGLE_RAD = math.radians(135.0)      
 STRIKE_ZONE_BUFFER_DIST = 0.3      
 STRIKE_ZONE_BUFFER_ANGLE_RAD = math.radians(15.0)
-CAPTURE_DISTANCE = 0.5 # IF the bot and enemy distance is 50cm or less the, this is capture distnace       
+     
 COOLDOWN_DURATION_SEC = 5.0        
 
 TF_TIMEOUT_SEC = 2.5               
@@ -34,8 +34,8 @@ MIN_STATE_LOCK_SEC = 0.5
 class StateMachine(Node):
     """
     High-level operational brain. 
-    [OPTIMIZED]: Zero-Conversion 
-    Native Radian Tracking.
+    [OPTIMIZED]: Zero-Conversion Native Radian Tracking.
+    Synchronized via /capture_event to ensure Cooldowns only trigger when photos are actually taken.
     """
     def __init__(self):
         super().__init__('state_machine')
@@ -68,6 +68,12 @@ class StateMachine(Node):
         state_topic = f'/{self.robot_ns}/robot_state' if self.robot_ns else '/robot_state'
         self.state_pub = self.create_publisher(String, state_topic, 10)
 
+        # --- CAPTURE EVENT SYNC ---
+        # Listens to the Goal Sender. Guarantees that the State Machine will never 
+        # trigger a 5-second cooldown unless a photo was physically taken.
+        capture_event_topic = f'/{self.robot_ns}/capture_event' if self.robot_ns else '/capture_event'
+        self.capture_sub = self.create_subscription(Bool, capture_event_topic, self.capture_cb, 10)
+
         self.last_state_change_time = None
         self.last_tf_success_time = None
         self.last_enemy_dist = None
@@ -75,6 +81,17 @@ class StateMachine(Node):
 
         self.timer = self.create_timer(CONTROL_LOOP_RATE_SEC, self.control_loop)
         self.get_logger().info(f"[STATE MACHINE] Initialized. Native Radian Geometry Active.")
+
+    def capture_cb(self, msg):
+        """
+        Force-flips the State Machine into COOLDOWN the exact millisecond 
+        the Goal Sender publishes a successful capture flag. 
+        (Removed the STRIKING restriction to allow for instant opportunistic captures!)
+        """
+        if msg.data:
+            self.get_logger().info(f'[STATE MACHINE] >> EVENT SYNC << Capture confirmed by Goal Sender! Halting for COOLDOWN ({COOLDOWN_DURATION_SEC}s).')
+            self.state = 'COOLDOWN'
+            self.last_state_change_time = self.get_clock().now()
 
     # Getting baseline of our bot from the enemy perspective
     def get_pursuer_in_enemy_frame(self):
@@ -131,19 +148,6 @@ class StateMachine(Node):
         # Getting our enemy tf
         rel_x, rel_y = self.get_pursuer_in_enemy_frame()
 
-        # --- CAMERA FOV CHECK FOR COOLDOWN SYNC ---
-        is_in_fov = False
-        try:
-            cam_tf = self.tf_buffer.lookup_transform(self.pursuer_frame, self.enemy_frame, rclpy.time.Time())
-            cam_dx = cam_tf.transform.translation.x
-            cam_dy = cam_tf.transform.translation.y
-            
-            # +/- 0.872 rad is the 100-degree viewing cone
-            if abs(math.atan2(cam_dy, cam_dx)) <= 0.872:
-                is_in_fov = True
-        except tf2_ros.TransformException:
-            pass
-
         # Checking if lost tf tree
         if rel_x is None: 
             if (current_time_sec - (self.last_tf_success_time.nanoseconds / 1e9) > TF_TIMEOUT_SEC) and (self.state != 'CHASING'):
@@ -187,12 +191,8 @@ class StateMachine(Node):
                 self.last_state_change_time = now
 
         elif self.state == 'STRIKING':
-            # [FIXED]: Now requires the enemy to actually be in the camera's FOV before declaring victory!
-            if dist <= CAPTURE_DISTANCE and is_in_fov:
-                self.get_logger().info(f'[STATE MACHINE] >> SUCCESSFUL CAPTURE << Halting offense for COOLDOWN ({COOLDOWN_DURATION_SEC}s).')
-                self.state = 'COOLDOWN'
-                self.last_state_change_time = now
-            elif in_danger:
+            # Note: Transition to COOLDOWN is exclusively handled by capture_cb() now!
+            if in_danger:
                 self.get_logger().warn(f'[STATE MACHINE] Enemy countered during Strike. Breaking off to EVADING.')
                 self.state = 'EVADING'
                 self.last_state_change_time = now

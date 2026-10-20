@@ -1,4 +1,3 @@
-# kill_pose_2.py
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
@@ -7,7 +6,10 @@ from geometry_msgs.msg import TransformStamped
 
 # --- GLOBAL TUNING VARIABLES ---
 # Reduced from 1.0m to 0.45m to keep the target clear of massive 0.35m costmap inflation zones.
-DEFAULT_DISTANCE_BEHIND = 0.45 
+# ==============================================================
+# MIGHT NEED TO CHANGE
+# ==============================================================
+DEFAULT_DISTANCE_BEHIND = 0.40 
 # TF broadcast rate (~30Hz) for smooth, high-fidelity target tracking
 BROADCAST_RATE_SEC = 1.0 / 30.0 
 

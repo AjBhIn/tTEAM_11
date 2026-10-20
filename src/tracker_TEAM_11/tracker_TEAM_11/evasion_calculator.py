@@ -8,6 +8,9 @@ from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import String
 import numpy as np
 
+# --- REQUIRED FOR QOS (QUALITY OF SERVICE) SPLIT ---
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+
 # --- GLOBAL TUNING VARIABLES ---
 LOOP_RATE_SEC = 0.033
 
@@ -76,7 +79,15 @@ class EvasionCalculator(Node):
         costmap_topic = f'/{self.robot_ns}/global_costmap/costmap' if self.robot_ns else '/global_costmap/costmap'
 
         self.state_sub = self.create_subscription(String, state_topic, self.state_cb, 10)
-        self.costmap_sub = self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_callback, 10)
+        
+        # --- QOS BOOT DELAY FIX ---
+        # Forces immediate pull of latched global costmap on startup
+        costmap_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE
+        )
+        self.costmap_sub = self.create_subscription(OccupancyGrid, costmap_topic, self.costmap_callback, costmap_qos)
 
         # --- PRE-COMPUTED MEMORY-SAFE CACHES ---
         # 1. Standard Escape Grid
@@ -122,6 +133,10 @@ class EvasionCalculator(Node):
         self.get_logger().info("[EVASION CALCULATOR] Initialized. Zero-Allocation Math Arrays Active.")
 
     def state_cb(self, msg):
+        # --- STALE EVASION LOCK FIX ---
+        # Ensures that if we re-enter EVADING after a long break, the slide timer resets.
+        if self.current_state != msg.data and msg.data == 'EVADING':
+            self.slide_lock_time = 0.0
         self.current_state = msg.data
 
     @staticmethod
@@ -506,7 +521,6 @@ class EvasionCalculator(Node):
                 return spin_x, spin_y, best_yaw
 
         # --- PHASE 3: Absolute Last Resort (Completely Trapped) ---
-        # TODO: IF COMPLETELY STUCK, then rotate to enemy to take a photo
         self.get_logger().error("[EVASION EMERGENCY] Phase 3: Completely trapped! Forcing blind 180-spin from enemy.")
         angle_to_enemy = math.atan2(enemy_y - global_y, enemy_x - global_x)
         escape_yaw = angle_to_enemy + math.pi # Spin 180 away from enemy
@@ -604,12 +618,10 @@ class EvasionCalculator(Node):
             self.active_target_x = target_x
             self.active_target_y = target_y
         else:
-            # Get the best path: This point runs / 
-            # connects all the other function: get cost, get_path ....
+            # Get the best path: This point runs / connects all the other function
             best_target, max_score = self.evaluate_and_select_best_escape(
                 global_x, global_y, our_yaw, enemy_global_x, enemy_global_y, enemy_global_yaw
             )
-
 
             # RUNNING EMERGENCY ESCAPE if No path found
             is_emergency = False
