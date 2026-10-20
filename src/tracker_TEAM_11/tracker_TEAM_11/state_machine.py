@@ -131,6 +131,19 @@ class StateMachine(Node):
         # Getting our enemy tf
         rel_x, rel_y = self.get_pursuer_in_enemy_frame()
 
+        # --- CAMERA FOV CHECK FOR COOLDOWN SYNC ---
+        is_in_fov = False
+        try:
+            cam_tf = self.tf_buffer.lookup_transform(self.pursuer_frame, self.enemy_frame, rclpy.time.Time())
+            cam_dx = cam_tf.transform.translation.x
+            cam_dy = cam_tf.transform.translation.y
+            
+            # +/- 0.872 rad is the 100-degree viewing cone
+            if abs(math.atan2(cam_dy, cam_dx)) <= 0.872:
+                is_in_fov = True
+        except tf2_ros.TransformException:
+            pass
+
         # Checking if lost tf tree
         if rel_x is None: 
             if (current_time_sec - (self.last_tf_success_time.nanoseconds / 1e9) > TF_TIMEOUT_SEC) and (self.state != 'CHASING'):
@@ -174,7 +187,8 @@ class StateMachine(Node):
                 self.last_state_change_time = now
 
         elif self.state == 'STRIKING':
-            if dist <= CAPTURE_DISTANCE:
+            # [FIXED]: Now requires the enemy to actually be in the camera's FOV before declaring victory!
+            if dist <= CAPTURE_DISTANCE and is_in_fov:
                 self.get_logger().info(f'[STATE MACHINE] >> SUCCESSFUL CAPTURE << Halting offense for COOLDOWN ({COOLDOWN_DURATION_SEC}s).')
                 self.state = 'COOLDOWN'
                 self.last_state_change_time = now
