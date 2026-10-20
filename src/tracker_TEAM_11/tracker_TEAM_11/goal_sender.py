@@ -183,12 +183,27 @@ class GoalSender(Node):
         try:
             rel_tf = self.tf_buffer.lookup_transform(
                 self.robot_frame, self.enemy_frame, rclpy.time.Time())
-            rel_dist = math.hypot(rel_tf.transform.translation.x, rel_tf.transform.translation.y)
-            if rel_dist <= CAPTURE_DISTANCE_M:
-                rel_orient = self.get_yaw_from_quaternion(rel_tf.transform.rotation)
-                self.trigger_capture_report(rel_dist, rel_orient)
+            
+            dx = rel_tf.transform.translation.x
+            dy = rel_tf.transform.translation.y
+            
+            # [OPTIMIZED]: Squaring your existing CAPTURE_DISTANCE_M inline
+            if (dx*dx + dy*dy) <= (CAPTURE_DISTANCE_M ** 2):
+                
+                # --- FIELD OF VIEW (FOV) LOCK ---
+                # math.atan2(dy, dx) returns 0.0 when the enemy is dead-center.
+                # +/- 0.872 radians allows a total 100-degree forward viewing cone.
+                angle_to_enemy_camera = abs(math.atan2(dy, dx))
+                
+                if angle_to_enemy_camera <= 0.872:
+                    rel_orient = self.get_yaw_from_quaternion(rel_tf.transform.rotation)
+                    # Calculate exact distance only when firing the final report
+                    rel_dist = math.hypot(dx, dy) 
+                    self.trigger_capture_report(rel_dist, rel_orient)
+                    
         except tf2_ros.TransformException:
             pass
+
 
         if self.force_update:
             self.is_goal_pending = False
